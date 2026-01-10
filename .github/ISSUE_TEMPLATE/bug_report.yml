@@ -1,0 +1,23 @@
+name: Bug Report
+about: Report a bug
+labels: [bug]
+body:
+  - type: textarea
+    attributes:
+      label: What happened?
+      description: Please describe the issue.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Steps to reproduce
+      placeholder: "1. ... 2. ..."
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected behavior
+  - type: textarea
+    attributes:
+      label: Environment
+      description: OS, Rust version, config summary, etc.

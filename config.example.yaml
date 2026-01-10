@@ -1,0 +1,250 @@
+# TitanDNS Example Config (Sanitized)
+# - No secrets
+# - Designed for one-click install
+
+log:
+  level: "info"
+  file: "/var/log/titandns/titandns.log"
+
+query_log:
+  enabled: true
+  max_size: 2000
+  recent_blocked_limit: 200
+
+singbox:
+  auto_discover: true
+  socks_port: 7891
+  deadlock_domains: ["github.com", "raw.githubusercontent.com"]
+
+api:
+  http: "0.0.0.0:8080"
+
+ebpf:
+  interface: "eth0"   # TODO: change to your NIC name
+  bpf_path: "/etc/titandns/titan_dns_filter.o"
+  xdp_cache:
+    enabled: true
+    max_entries: 100000
+    sync_hot_queries: true
+
+plugins:
+  adblock_main:
+    type: "adblock"
+    files:
+      - "/etc/titandns/rules/adguard.txt"
+
+  dga_filter:
+    type: "dga"
+    entropy_threshold: 4.5
+    min_len: 12
+    dry_run: true
+
+  cache_domestic:
+    type: "cache"
+    size: 100000
+    fakeip_protection: false
+    recursive_mode: false
+    prefetch_if_ttl_less_than: 120
+    serve_stale_ttl: 30
+    upstreams:
+      - addr: "udp://119.29.29.29:53"
+        so_mark: 255
+      - addr: "udp://223.5.5.5:53"
+        so_mark: 255
+    persist_file: "/dev/shm/titandns/domestic.db"
+    persist_interval: 300
+
+  cache_proxy:
+    type: "cache"
+    size: 100000
+    fakeip_protection: true
+    recursive_mode: false
+    prefetch_if_ttl_less_than: 120
+    serve_stale_ttl: 30
+    upstreams:
+      - addr: "https://cloudflare-dns.com/dns-query"
+        socks5: "127.0.0.1:7891"
+      - addr: "https://dns.google/dns-query"
+        socks5: "127.0.0.1:7891"
+    persist_file: "/dev/shm/titandns/proxy.db"
+    persist_interval: 300
+
+  hosts_custom:
+    type: "hosts"
+    file: "/etc/titandns/rules/hosts.txt"
+
+  matcher_blocklist:
+    type: "matcher"
+    files:
+      - "/etc/titandns/rules/blocklist.txt"
+      - "/etc/titandns/rules/pcdnlist.txt"
+
+  matcher_whitelist:
+    type: "matcher"
+    files:
+      - "/etc/titandns/rules/whitelist.txt"
+      - "/etc/titandns/rules/ddnslist.txt"
+    mark: "direct"
+
+  matcher_greylist:
+    type: "matcher"
+    files: ["/etc/titandns/rules/greylist.txt"]
+    mark: "proxy"
+
+  ip_matcher_cn:
+    type: "ip_matcher"
+    files:
+      - "/etc/titandns/rules/cn_ipv4.txt"
+      - "/etc/titandns/rules/cn_ipv6.txt"
+      - "/etc/titandns/rules/cn_ipv4_apnic.txt"
+      - "/etc/titandns/rules/cn_ipv6_apnic.txt"
+    mark: "ip_cn_accurate"
+
+  upstream_local:
+    type: "forward"
+    strategy: "race"
+    concurrent: 512
+    timeout: 2000
+    upstreams:
+      - addr: "udp://119.29.29.29:53"
+        so_mark: 255
+      - addr: "udp://223.5.5.5:53"
+        so_mark: 255
+      - addr: "udp://114.114.114.114:53"
+        so_mark: 255
+
+  upstream_fakeip:
+    type: "forward"
+    strategy: "order"
+    concurrent: 512
+    timeout: 1500
+    upstreams:
+      - addr: "udp://127.0.0.1:6666"
+
+  upstream_doh:
+    type: "forward"
+    strategy: "race"
+    concurrent: 128
+    timeout: 5000
+    upstreams:
+      - addr: "https://cloudflare-dns.com/dns-query"
+        socks5: "127.0.0.1:7891"
+      - addr: "https://dns.google/dns-query"
+        socks5: "127.0.0.1:7891"
+
+  smart_splitter:
+    type: "smart_forward"
+    geoip: "geoip_cn"
+    local:
+      addr: "udp://119.29.29.29:53"
+    fakeip:
+      addr: "udp://127.0.0.1:6666"
+
+  ecs_cn:
+    type: "ecs"
+    auto: true
+    ipv4_netmask: 24
+    ipv6_netmask: 56
+
+  geosite_cn:
+    type: "geosite"
+    target: "cn"
+    files:
+      - "/etc/titandns/geosite.dat:cn"
+      - "/etc/titandns/geosite.dat:apple"
+      - "/etc/titandns/geosite.dat:steam"
+    mark: "cn"
+
+  geosite_proxy:
+    type: "geosite"
+    target: "geolocation-!cn"
+    files:
+      - "/etc/titandns/geosite.dat:geolocation-!cn"
+    mark: "proxy"
+
+  geoip_cn:
+    type: "geoip"
+    file: "/etc/titandns/geoip.mmdb"
+    code: "cn"
+    tag: "ip_cn"
+    mode: "response"
+
+  reject_nxdomain:
+    type: "reject"
+    rcode: "nxdomain"
+
+  dnssec:
+    type: "dnssec"
+    mode: "permissive"
+
+  ipv6_filter:
+    type: "ipv6_filter"
+    mode: "prefer_ipv6"
+    delay_aaaa_ms: 10
+
+sequences:
+  sequence_main:
+    - exec: ipv6_filter
+    - matches: [{ qtype: [12, 65] }]
+      exec: reject_nxdomain
+    - exec: adblock_main
+    - exec: dga_filter
+    - matches: [{ match_plugin: matcher_blocklist }]
+      exec: reject_nxdomain
+    - exec: cache_domestic
+    - exec: hosts_custom
+    - exec: ecs_cn
+    - matches: [{ match_plugin: matcher_whitelist }]
+      exec: sequence_local
+    - matches: [{ match_plugin: matcher_greylist }]
+      exec: sequence_proxy
+    - exec: geosite_cn
+    - exec: geosite_proxy
+    - matches: [{ has_tag: "cn" }]
+      exec: sequence_local
+    - matches: [{ has_tag: "proxy" }]
+      exec: sequence_proxy
+    - exec: smart_splitter
+    - exec: ip_matcher_cn
+    - matches: [{ has_tag: "ip_cn_accurate" }]
+      exec: sequence_local
+    - exec: dnssec
+
+  sequence_local:
+    - exec: cache_domestic
+    - exec: upstream_local
+
+  sequence_proxy:
+    - exec: cache_proxy
+    - exec: upstream_fakeip
+
+  sequence_doh:
+    - exec: upstream_doh
+    - exec: dnssec
+
+servers:
+  - protocol: udp
+    addr: "0.0.0.0:53"
+    entry: sequence_main
+    socket_opts:
+      so_reuseport: true
+      batch_io: true
+      so_rcvbuf: 16777216
+      so_sndbuf: 16777216
+      workers: 0
+
+  - protocol: udp
+    addr: "0.0.0.0:8888"
+    entry: sequence_local
+    socket_opts:
+      so_reuseport: true
+      so_rcvbuf: 8388608
+      so_sndbuf: 8388608
+      workers: 0
+
+  - protocol: udp
+    addr: "0.0.0.0:8530"
+    entry: sequence_doh
+    socket_opts:
+      so_reuseport: true
+      workers: 0

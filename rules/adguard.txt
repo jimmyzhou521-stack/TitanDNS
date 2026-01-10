@@ -1,0 +1,8 @@
+! AdBlock Rules (TitanDNS Optimized)
+||doubleclick.net^
+||googlesyndication.com^
+||ads.google.com^
+||adnxs.com^
+||ads-twitter.com^
+||tracking.example.com^
+@@||whitelist-example.com^
