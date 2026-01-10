@@ -1,6 +1,6 @@
 # TitanDNS
 
-[??](README.zh-CN.md) | English
+[中文](README.zh-CN.md) | English
 
 TitanDNS is a high-performance DNS forwarder written in Rust, with optional eBPF acceleration on Linux.
 This repository is published from the `online` branch and only includes the minimal public source set:
