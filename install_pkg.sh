@@ -47,6 +47,44 @@ RULES_DIR="$CONF_DIR/rules"
 LOG_DIR="/var/log/titandns"
 CACHE_DIR="/dev/shm/titandns"
 
+DNS_BACKUP="$CONF_DIR/resolv.conf.bak"
+RESOLVED_DROPIN_DIR="/etc/systemd/resolved.conf.d"
+RESOLVED_DROPIN_FILE="$RESOLVED_DROPIN_DIR/titandns.conf"
+
+is_systemd_resolved() {
+  command -v resolvectl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved
+}
+
+set_dns_custom() {
+  local dns_ip="$1"
+  if is_systemd_resolved; then
+    mkdir -p "$RESOLVED_DROPIN_DIR"
+    cat > "$RESOLVED_DROPIN_FILE" <<EOF
+[Resolve]
+DNS=$dns_ip
+EOF
+    systemctl restart systemd-resolved || true
+  else
+    if [ -f /etc/resolv.conf ] && [ ! -f "$DNS_BACKUP" ]; then
+      cp /etc/resolv.conf "$DNS_BACKUP"
+    fi
+    cat > /etc/resolv.conf <<EOF
+nameserver $dns_ip
+options timeout:2 attempts:2
+EOF
+  fi
+}
+
+restore_dns() {
+  if [ -f "$DNS_BACKUP" ]; then
+    cp "$DNS_BACKUP" /etc/resolv.conf
+  fi
+  if [ -f "$RESOLVED_DROPIN_FILE" ]; then
+    rm -f "$RESOLVED_DROPIN_FILE"
+    systemctl restart systemd-resolved || true
+  fi
+}
+
 # 1. 权限检查
 if [ "$EUID" -ne 0 ]; then
     log_error "请使用 root 用户运行此脚本: sudo bash install.sh"
@@ -337,6 +375,43 @@ set -euo pipefail
 CONF_DIR="/etc/titandns"
 BIN="/usr/local/bin/titandns"
 REPO="jimmyzhou521-stack/TitanDNS"
+DNS_BACKUP="/etc/titandns/resolv.conf.bak"
+RESOLVED_DROPIN_DIR="/etc/systemd/resolved.conf.d"
+RESOLVED_DROPIN_FILE="$RESOLVED_DROPIN_DIR/titandns.conf"
+
+is_systemd_resolved() {
+  command -v resolvectl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved
+}
+
+set_dns_custom() {
+  local dns_ip="$1"
+  if is_systemd_resolved; then
+    mkdir -p "$RESOLVED_DROPIN_DIR"
+    cat > "$RESOLVED_DROPIN_FILE" <<EOF
+[Resolve]
+DNS=$dns_ip
+EOF
+    systemctl restart systemd-resolved || true
+  else
+    if [ -f /etc/resolv.conf ] && [ ! -f "$DNS_BACKUP" ]; then
+      cp /etc/resolv.conf "$DNS_BACKUP"
+    fi
+    cat > /etc/resolv.conf <<EOF
+nameserver $dns_ip
+options timeout:2 attempts:2
+EOF
+  fi
+}
+
+restore_dns() {
+  if [ -f "$DNS_BACKUP" ]; then
+    cp "$DNS_BACKUP" /etc/resolv.conf
+  fi
+  if [ -f "$RESOLVED_DROPIN_FILE" ]; then
+    rm -f "$RESOLVED_DROPIN_FILE"
+    systemctl restart systemd-resolved || true
+  fi
+}
 
 help() {
   cat <<EOF
@@ -380,6 +455,12 @@ case "$CMD" in
       read -r -p "是否删除配置目录 /etc/titandns？(y/N): " ans2
       if [[ "$ans2" =~ ^[Yy]$ ]]; then
         rm -rf "$CONF_DIR"
+        restore_dns
+      else
+        read -r -p "是否恢复系统 DNS 到 223.5.5.5？(Y/n): " ans3
+        if [[ -z "$ans3" || "$ans3" =~ ^[Yy]$ ]]; then
+          set_dns_custom "223.5.5.5"
+        fi
       fi
       echo "卸载完成"
     fi
@@ -491,6 +572,17 @@ else
     fi
     log_error "请检查日志: journalctl -u titandns -n 50"
     exit 1
+fi
+
+# 15. 系统 DNS 指向
+if [ "$INTERACTIVE" -eq 1 ]; then
+    ans=$(ask_yes_no "是否将系统 DNS 指向 127.0.0.1（TitanDNS）？[Y/n] " "Y")
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        set_dns_custom "127.0.0.1"
+        log_success "系统 DNS 已指向 127.0.0.1"
+    else
+        log_warn "未修改系统 DNS，可手动设置或使用 tdns 命令"
+    fi
 fi
 
 echo ""
