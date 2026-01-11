@@ -15,6 +15,26 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 
+INTERACTIVE=1
+if [ ! -t 0 ]; then
+  INTERACTIVE=0
+fi
+
+ask_yes_no() {
+  local prompt="$1"
+  local default="$2"
+  local ans=""
+  if [ "$INTERACTIVE" -eq 0 ]; then
+    echo "$default"
+    return
+  fi
+  read -r -p "$prompt" ans
+  if [ -z "$ans" ]; then
+    ans="$default"
+  fi
+  echo "$ans"
+}
+
 SKIP_EBPF=0
 if [[ "${1:-}" == "--no-ebpf" ]]; then
   SKIP_EBPF=1
@@ -160,13 +180,41 @@ fi
 if [ -n "$PRIMARY_IF" ]; then
     log_success "检测到主网卡: $PRIMARY_IF"
     if grep -q 'interface:' "$CONF_DIR/config.yaml"; then
+        use_if=$(ask_yes_no "使用该网卡作为 eBPF 接口？[Y/n] " "Y")
+        if [[ "$use_if" =~ ^[Nn]$ ]]; then
+            if [ "$INTERACTIVE" -eq 1 ]; then
+                read -r -p "请输入网卡名称: " NEW_IF
+                if [ -n "$NEW_IF" ]; then
+                    PRIMARY_IF="$NEW_IF"
+                fi
+            fi
+        fi
         sed -i "s/interface: \".*\"/interface: \"$PRIMARY_IF\"/" "$CONF_DIR/config.yaml"
-        log_success "配置文件已自动更新网卡为: $PRIMARY_IF"
+        log_success "配置文件已更新网卡为: $PRIMARY_IF"
     fi
 else
     log_warn "无法自动检测网卡，请手动修改 $CONF_DIR/config.yaml 中的 interface 参数"
+    if [ "$INTERACTIVE" -eq 1 ]; then
+        read -r -p "请输入网卡名称(回车跳过): " NEW_IF
+        if [ -n "$NEW_IF" ]; then
+            if grep -q 'interface:' "$CONF_DIR/config.yaml"; then
+                sed -i "s/interface: \".*\"/interface: \"$NEW_IF\"/" "$CONF_DIR/config.yaml"
+                log_success "配置文件已更新网卡为: $NEW_IF"
+            fi
+        fi
+    fi
 fi
 log_success "配置文件已安装"
+
+# 6.2 科学上游地址确认
+if [ "$INTERACTIVE" -eq 1 ]; then
+    DEFAULT_FAKEIP="udp://127.0.0.1:6666"
+    read -r -p "科学上游(FakeIP)当前为 $DEFAULT_FAKEIP 。若为远端或需修改请输入新地址(回车保持): " NEW_FAKEIP
+    if [ -n "$NEW_FAKEIP" ]; then
+        sed -i "s|$DEFAULT_FAKEIP|$NEW_FAKEIP|g" "$CONF_DIR/config.yaml"
+        log_success "已更新 FakeIP 上游为: $NEW_FAKEIP"
+    fi
+fi
 
 # 7. 规则文件
 log_info "安装规则文件..."
