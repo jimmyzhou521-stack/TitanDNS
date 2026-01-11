@@ -60,6 +60,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev
 
+      - name: Install UPX (Linux x86_64)
+        if: runner.os == 'Linux' && (matrix.arch == 'x86_64' || matrix.arch == 'x86_64-v3')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y upx-ucl
+
       - name: Build (release)
         run: cargo build --release --target ${{ matrix.target }}
         env:
@@ -92,6 +98,22 @@ jobs:
           cp config.example.yaml dist/config.yaml
           cp -R rules/* dist/rules/ 2>/dev/null || true
           chmod +x dist/install.sh dist/update_rules.sh dist/health_check.sh
+
+          # UPX compress (release only)
+          if [ "$RUNNER_OS" = "Linux" ] && { [ "${{ matrix.arch }}" = "x86_64" ] || [ "${{ matrix.arch }}" = "x86_64-v3" ]; }; then
+            if command -v upx >/dev/null 2>&1; then
+              upx --best --lzma dist/bin/titandns || echo "upx failed"
+            fi
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            if command -v upx >/dev/null 2>&1; then
+              upx --best --lzma dist/bin/titandns.exe || echo "upx failed"
+            else
+              choco install upx -y || true
+              if command -v upx >/dev/null 2>&1; then
+                upx --best --lzma dist/bin/titandns.exe || echo "upx failed"
+              fi
+            fi
+          fi
           ARCHIVE="titandns-${VERSION}-${DATE}-${RUNNER_OS}-${{ matrix.arch }}.tar.gz"
           tar -czf "$ARCHIVE" -C dist .
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
