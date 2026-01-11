@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="jimmyzhou521-stack/TitanDns"
+REPO="jimmyzhou521-stack/TitanDNS"
 VERSION="${1:-latest}"
 OS="Linux"
 ARCH_RAW=$(uname -m)
@@ -48,12 +48,12 @@ if [[ "$VERSION" != "latest" ]]; then
   api_url="https://api.github.com/repos/${REPO}/releases/tags/${VERSION}"
 fi
 
-asset_url=$(curl -fsSL "$api_url" | grep -Eo '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]+"' | cut -d '"' -f4 | grep "-${OS}-${ARCH}\.tar\.gz" | head -n1 || true)
+asset_url=$(curl -fsSL "$api_url" | grep -Eo '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]+"' | cut -d '"' -f4 | grep -- "-${OS}-${ARCH}\.tar\.gz" | head -n1 || true)
 if [[ -z "$asset_url" && "$ARCH" == "x86_64-v3" ]]; then
   ARCH="x86_64"
-  asset_url=$(curl -fsSL "$api_url" | grep -Eo '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]+"' | cut -d '"' -f4 | grep "-${OS}-${ARCH}\.tar\.gz" | head -n1 || true)
+  asset_url=$(curl -fsSL "$api_url" | grep -Eo '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]+"' | cut -d '"' -f4 | grep -- "-${OS}-${ARCH}\.tar\.gz" | head -n1 || true)
 fi
-checksum_url=$(curl -fsSL "$api_url" | grep -Eo '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]+"' | cut -d '"' -f4 | grep "SHA256SUMS\.txt" | head -n1 || true)
+checksum_url=$(curl -fsSL "$api_url" | grep -Eo '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]+"' | cut -d '"' -f4 | grep -- "SHA256SUMS\.txt" | head -n1 || true)
 
 if [[ -z "$asset_url" ]]; then
   echo "Failed to find release asset for ${OS}." >&2
