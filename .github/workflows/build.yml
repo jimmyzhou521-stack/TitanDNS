@@ -1,8 +1,6 @@
 name: build
 
 on:
-  push:
-    branches: ["online"]
   pull_request:
     branches: ["online"]
   workflow_dispatch:
