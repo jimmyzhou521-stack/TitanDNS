@@ -84,6 +84,16 @@ fi
 log_success "系统兼容性检查通过"
 
 # 2. 停止旧服务
+if [ -x "/usr/local/bin/titandns" ]; then
+    if [ "$INTERACTIVE" -eq 1 ]; then
+        ans=$(ask_yes_no "检测到已安装 TitanDNS，是否重新安装？[Y/n] " "Y")
+        if [[ "$ans" =~ ^[Nn]$ ]]; then
+            log_warn "已取消安装。"
+            exit 0
+        fi
+    fi
+fi
+
 if systemctl is-active --quiet titandns; then
     log_info "停止现有服务..."
     systemctl stop titandns
@@ -158,6 +168,9 @@ else
     else
         log_warn "未找到 eBPF 文件 (XDP 加速将不可用)"
     fi
+fi
+if [ -f "$WORK_DIR/bpf/titan_filter.c" ]; then
+    cp "$WORK_DIR/bpf/titan_filter.c" "$CONF_DIR/titan_filter.c"
 fi
 
 # 6. 配置文件
@@ -313,6 +326,104 @@ if [ -f "$WORK_DIR/health_check.sh" ]; then
     cp "$WORK_DIR/health_check.sh" "$CONF_DIR/"
     chmod +x "$CONF_DIR/health_check.sh"
 fi
+
+# 12.1 安装 tdns 快捷指令
+cat > "$BIN_DIR/tdns" <<'TDNS_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONF_DIR="/etc/titandns"
+BIN="/usr/local/bin/titandns"
+REPO="jimmyzhou521-stack/TitanDNS"
+
+help() {
+  cat <<EOF
+tdns commands:
+  status|start|stop|restart   Service control
+  logs                        Follow logs
+  config                      Edit config.yaml
+  update|reinstall            Reinstall latest release
+  uninstall                   Uninstall (asks confirmation)
+  rules                       Update rules now
+  rules-install               Install rules update timer
+  bpf-rebuild                 Rebuild eBPF (if titan_filter.c exists)
+  kernel-check                Show current kernel version
+  kernel-update               Update kernel packages (interactive)
+EOF
+}
+
+CMD="${1:-help}"
+
+case "$CMD" in
+  status|start|stop|restart)
+    systemctl "$CMD" titandns
+    ;;
+  logs)
+    journalctl -u titandns -f
+    ;;
+  config)
+    ${EDITOR:-nano} "$CONF_DIR/config.yaml"
+    ;;
+  update|reinstall)
+    curl -fsSL "https://raw.githubusercontent.com/${REPO}/online/install.sh" | bash
+    ;;
+  uninstall)
+    read -r -p "确认卸载 TitanDNS？将移除服务与二进制文件 (Y/N): " ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+      systemctl stop titandns || true
+      systemctl disable titandns || true
+      rm -f /etc/systemd/system/titandns.service
+      systemctl daemon-reload || true
+      rm -f "$BIN" /usr/local/bin/tdns
+      read -r -p "是否删除配置目录 /etc/titandns？(y/N): " ans2
+      if [[ "$ans2" =~ ^[Yy]$ ]]; then
+        rm -rf "$CONF_DIR"
+      fi
+      echo "卸载完成"
+    fi
+    ;;
+  rules)
+    bash "$CONF_DIR/update_rules.sh"
+    ;;
+  rules-install)
+    bash "$CONF_DIR/update_rules.sh" --install
+    ;;
+  bpf-rebuild)
+    if [ -f "$CONF_DIR/titan_filter.c" ]; then
+      if ! command -v clang >/dev/null 2>&1; then
+        echo "clang 未安装，请先安装 clang/llvm"
+        exit 1
+      fi
+      clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -I/usr/include -I/usr/include/x86_64-linux-gnu \
+        -c "$CONF_DIR/titan_filter.c" -o "$CONF_DIR/titan_dns_filter.o"
+      echo "eBPF 已重新编译：$CONF_DIR/titan_dns_filter.o"
+    else
+      echo "未找到 $CONF_DIR/titan_filter.c"
+    fi
+    ;;
+  kernel-check)
+    uname -a
+    ;;
+  kernel-update)
+    echo "⚠️ 该操作会更新内核并可能需要重启。"
+    read -r -p "确认继续？(Y/N): " ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+      if command -v apt-get >/dev/null 2>&1; then
+        apt-get update && apt-get install -y linux-image-generic
+      elif command -v yum >/dev/null 2>&1; then
+        yum update -y kernel
+      else
+        echo "未识别的包管理器，请手动更新内核。"
+      fi
+    fi
+    ;;
+  help|*)
+    help
+    ;;
+esac
+TDNS_EOF
+chmod +x "$BIN_DIR/tdns"
+log_success "已安装 tdns 快捷指令"
 
 # 13. Systemd 服务
 log_info "配置 Systemd 服务..."
