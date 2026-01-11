@@ -238,6 +238,8 @@ for f in adguard.txt blocklist.txt whitelist.txt hosts.txt greylist.txt ddnslist
     touch "$RULES_DIR/$f"
 done
 log_success "规则文件已安装"
+log_info "规则已内置并可直接使用（无需再次运行 update_rules.sh）"
+log_info "如需定时更新规则：tdns rules-install"
 
 # 8. Dashboard
 log_info "安装 Dashboard..."
