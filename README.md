@@ -1,154 +1,220 @@
-# TitanDNS
+<p align="center">
+  <img src="www/logo.svg" alt="TitanDNS Logo" width="120" height="120">
+</p>
 
-[中文](README.zh-CN.md) | English
+<h1 align="center">TitanDNS</h1>
 
-TitanDNS is a high-performance DNS forwarder written in Rust, with optional eBPF acceleration on Linux.
-This repository is published from the `online` branch and only includes the minimal public source set:
-`src/`, `bpf/`, `www/`, and `Cargo.toml`.
+<p align="center">
+  <b>A next-generation, high-performance DNS forwarder powered by Rust and eBPF</b>
+</p>
 
-## Highlights
+<p align="center">
+  <a href="https://github.com/jimmyzhou521-stack/TitanDns/actions"><img src="https://github.com/jimmyzhou521-stack/TitanDns/actions/workflows/build.yml/badge.svg" alt="Build Status"></a>
+  <a href="https://github.com/jimmyzhou521-stack/TitanDns/releases"><img src="https://img.shields.io/github/v/release/jimmyzhou521-stack/TitanDns" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
+</p>
 
-- High-performance async core (Tokio)
-- Pluggable pipeline: cache, policy, Geo rules, and upstream routing
-- Hot reload for configuration
-- Optional eBPF fast-path acceleration (Linux)
-- Web UI assets included in `www/`
-- Metrics-friendly design (Prometheus)
+<p align="center">
+  <a href="README.zh-CN.md">中文</a> | English
+</p>
 
-## Typical Use Cases
+---
 
-- Home / lab DNS gateway with smart split routing
-- Edge / enterprise DNS forwarder with caching and policy control
-- Multi-upstream resolver with DoH/DoT and SOCKS support
+## ✨ Features
 
-## Architecture (Simplified)
+### 🚀 Performance
 
-1. Receive DNS query (UDP/TCP/DoH)
-2. Preprocess and normalize
-3. Run sequence pipeline (cache / rules / geo / upstream)
-4. Build response + optional caching
-5. Emit response + metrics
+- **High-performance async core** built on Tokio runtime
+- **Optional eBPF/XDP acceleration** for kernel-level DNS caching (5M+ QPS)
+- **Zero-copy parsing** with optimized memory allocation
+- **Batch I/O** support for high-throughput scenarios
 
-## Build
+### 🔧 Flexibility
 
-Prerequisites:
-- Rust stable toolchain
-- Linux kernel headers if you want to build eBPF programs (optional)
+- **Pluggable pipeline architecture**: cache, policy, Geo rules, upstream routing
+- **Hot configuration reload** without service restart
+- **Multiple protocols**: UDP, TCP, DoH (DNS-over-HTTPS), DoT (DNS-over-TLS), DoQ (DNS-over-QUIC)
+- **SOCKS5 proxy support** for upstream connections
 
-Build release:
+### 🧠 Intelligence
 
-```
-cargo build --release
-```
+- **Smart split routing**: Automatic domestic/foreign traffic classification
+- **Machine learning-based upstream selection** with Thompson Sampling
+- **Learning cache**: Domain classification learning and persistence
+- **FakeIP integration** with sing-box for transparent proxy
 
-## Run
+### 🛡️ Security
 
-You must provide your own config file (configs are intentionally not committed):
+- **DNSSEC validation** support
+- **DGA detection** for malware domain identification
+- **AdGuard-compatible AdBlock** rules
+- **Rate limiting** and query logging
 
-```
-./target/release/titandns --config /path/to/config.yaml
-```
+### 📊 Observability
 
-Sample config (sanitized): `config.example.yaml`.
+- **Built-in Web Dashboard** for monitoring and management
+- **Prometheus metrics** integration
+- **Detailed query logging** with blocking history
 
-## One-click Install (Linux)
+---
 
-```
+## 📦 Quick Start
+
+### One-click Install (Linux)
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/jimmyzhou521-stack/TitanDns/online/install.sh | bash
 ```
 
-The installer downloads the latest GitHub Release and runs the bundled `install.sh`.
-After install, edit `/etc/titandns/config.yaml` to fit your environment.
+**Supported platforms:**
 
-Supported: Linux x86_64, x86_64-v3, and arm64 (auto-detected).
+- Linux x86_64
+- Linux x86_64-v3 (Intel Haswell+, AMD Zen+)
+- Linux arm64 (Raspberry Pi 4, AWS Graviton)
 
-The installer verifies SHA256 checksums when `SHA256SUMS.txt` is present in the Release.
+After installation, edit `/etc/titandns/config.yaml` to fit your environment.
 
-## Configuration (Overview)
+### Build from Source
 
-Config format is YAML and typically contains:
+**Prerequisites:**
 
-- Global settings: `log`, `api`, `ebpf`
-- `plugins`: named plugin blocks (cache / forward / geo / matcher / etc.)
-- `sequences`: ordered execution chains
-- `servers`: listener definitions (UDP / TCP / HTTP)
+- Rust stable toolchain (1.70+)
+- Linux kernel headers (optional, for eBPF)
 
-### Example 1: Minimal UDP + Cache + Upstream
+```bash
+# Clone repository
+git clone https://github.com/jimmyzhou521-stack/TitanDns.git
+cd TitanDns
+
+# Build release
+cargo build --release
+
+# Run
+./target/release/titandns --config config.example.yaml
+```
+
+---
+
+## 🏗️ Architecture
 
 ```
-log:
-  level: "info"
+┌─────────────────────────────────────────────────────────────────┐
+│                        TitanDNS Core                            │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ │
+│  │   UDP    │  │   TCP    │  │   DoH    │  │  Web Dashboard   │ │
+│  │ Listener │  │ Listener │  │ Listener │  │   (Port 8080)    │ │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────────┬─────────┘ │
+│       │             │             │                  │          │
+│       └─────────────┴─────────────┴──────────────────┘          │
+│                              │                                   │
+│  ┌───────────────────────────▼───────────────────────────────┐  │
+│  │                    Plugin Pipeline                         │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────┐   │  │
+│  │  │  Cache  │→ │ GeoSite │→ │ Matcher │→ │SmartForward │   │  │
+│  │  └─────────┘  └─────────┘  └─────────┘  └─────────────┘   │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                              │                                   │
+│  ┌───────────────────────────▼───────────────────────────────┐  │
+│  │                    Upstream Layer                          │  │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐   │  │
+│  │  │UDP/TCP   │  │   DoH    │  │   DoT    │  │   DoQ    │   │  │
+│  │  │(Direct)  │  │ (SOCKS5) │  │ (SOCKS5) │  │(SOCKS5)  │   │  │
+│  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘   │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                              │                                   │
+│  ┌───────────────────────────▼───────────────────────────────┐  │
+│  │              eBPF/XDP Acceleration (Optional)              │  │
+│  │         Kernel-level DNS cache for ultra-low latency       │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
+---
+
+## ⚙️ Configuration
+
+TitanDNS uses YAML configuration format. See `config.example.yaml` for a complete example.
+
+### Configuration Structure
+
+```yaml
+log:           # Logging settings
+api:           # Dashboard & API settings  
+ebpf:          # eBPF/XDP acceleration (Linux only)
+plugins:       # Plugin definitions
+sequences:     # Execution pipelines
+servers:       # Listener definitions
+```
+
+### Plugin Types
+
+| Plugin | Description |
+|--------|-------------|
+| `cache` | High-performance DNS cache with prefetch and stale-serve |
+| `forward` | Upstream DNS forwarder (UDP/TCP/DoH/DoT/DoQ) |
+| `geosite` | Domain classification based on GeoSite rules |
+| `geoip` | IP classification based on MaxMind MMDB |
+| `matcher` | Domain pattern matching with tagging |
+| `smart_forward` | Intelligent split routing with learning |
+| `adblock` | AdGuard-compatible ad blocking |
+| `dnssec` | DNSSEC validation |
+| `ecs` | EDNS Client Subnet injection |
+| `ratelimit` | Query rate limiting |
+
+### Example: Smart Split Routing
+
+```yaml
 plugins:
-  cache_main:
-    type: "cache"
-    size: 100000
-    prefetch_if_ttl_less_than: 240
-    serve_stale_ttl: 120
-
-  upstream_default:
-    type: "forward"
-    strategy: "smart"
-    timeout_ms: 2000
-    upstreams:
-      - addr: "udp://1.1.1.1:53"
-
-sequences:
-  sequence_main:
-    - exec: cache_main
-    - exec: upstream_default
-
-servers:
-  - protocol: udp
-    addr: "0.0.0.0:53"
-    entry: sequence_main
-```
-
-### Example 2: Smart Split (Domestic vs Proxy)
-
-```
-plugins:
+  # Domestic cache
   cache_domestic:
     type: "cache"
     size: 100000
 
+  # Proxy cache (FakeIP)
   cache_proxy:
     type: "cache"
     size: 100000
+    fakeip_protection: true
 
+  # Domestic upstream
   upstream_local:
     type: "forward"
-    strategy: "smart"
+    strategy: "race"
     upstreams:
       - addr: "udp://223.5.5.5:53"
       - addr: "udp://119.29.29.29:53"
 
+  # FakeIP upstream (sing-box)
   upstream_fakeip:
     type: "forward"
-    strategy: "smart"
     upstreams:
-      - addr: "https://1.1.1.1/dns-query"
-        socks5: "127.0.0.1:7891"
+      - addr: "udp://127.0.0.1:6666"
 
+  # GeoSite rules
   geosite_cn:
     type: "geosite"
-    file: "/etc/titandns/geosite_cn.txt"
-    tag: "cn"
+    target: "cn"
+    files:
+      - "/etc/titandns/geosite.dat:cn"
+    mark: "cn"
 
-  matcher_proxy:
-    type: "matcher"
-    file: "/etc/titandns/greylist.txt"
-    tag: "proxy"
+  geosite_proxy:
+    type: "geosite"
+    target: "proxy"
+    files:
+      - "/etc/titandns/geosite.dat:gfw"
+    mark: "proxy"
 
 sequences:
   sequence_main:
     - exec: geosite_cn
-    - exec: matcher_proxy
-    - matches: [{ has_tag: "proxy" }]
-      exec: sequence_proxy
+    - exec: geosite_proxy
     - matches: [{ has_tag: "cn" }]
       exec: sequence_local
-    - exec: upstream_local  # fallback
+    - matches: [{ has_tag: "proxy" }]
+      exec: sequence_proxy
+    - exec: smart_splitter  # fallback
 
   sequence_local:
     - exec: cache_domestic
@@ -157,68 +223,77 @@ sequences:
   sequence_proxy:
     - exec: cache_proxy
     - exec: upstream_fakeip
-
-servers:
-  - protocol: udp
-    addr: "0.0.0.0:53"
-    entry: sequence_main
 ```
 
-### Example 3: DoH / DoT Upstreams
+---
 
-```
-plugins:
-  upstream_secure:
-    type: "forward"
-    strategy: "smart"
-    timeout_ms: 5000
-    upstreams:
-      - addr: "https://1.1.1.1/dns-query"
-        socks5: "127.0.0.1:7891"
-      - addr: "tls://1.1.1.1:853"
-        socks5: "127.0.0.1:7891"
-```
+## 📊 Web Dashboard
 
-### Example 4: eBPF (Linux)
+TitanDNS includes a built-in web dashboard for monitoring and management.
 
-```
-ebpf:
-  interface: "eth0"
-  bpf_path: "/etc/titandns/titan_dns_filter.o"
-  xdp_cache:
-    enabled: true
-    size: 1000000
-```
+**Access:** `http://your-server:8080`
 
-## Web UI
+Features:
 
-Static assets are provided in `www/`. You can serve them via your own web server or integrate
-with the TitanDNS HTTP endpoint (if enabled in your configuration).
+- Real-time query statistics
+- Upstream health monitoring
+- Cache hit rate visualization
+- Recent blocked queries
+- Configuration management
 
-## CI / Build Artifacts
+---
 
-On every push to `online`, GitHub Actions builds release binaries and uploads packaged artifacts
-(containing `titandns` + `www/` + `bpf/`). Artifact naming:
-`titandns-<version>-<date>-<os>.tar.gz` where `<version>` comes from `Cargo.toml`
-and `<date>` is in `YYYYMMDD`.
+## 🔧 Rule Updates
 
-## Release (Tags)
+Use the included script to automatically update GeoSite, GeoIP, and AdBlock rules:
 
-Create a git tag like `v1.0.0` and push it to trigger a GitHub Release:
+```bash
+# Manual update
+/etc/titandns/update_rules.sh
 
-```
-git tag v1.0.0
-git push origin v1.0.0
+# Install daily auto-update (02:00 AM)
+/etc/titandns/update_rules.sh --install
 ```
 
-## Contributing
+---
 
-See `CONTRIBUTING.md` and `CODE_OF_CONDUCT.md`.
+## 🏷️ Releases
 
-## Security
+Create and push a git tag to trigger a GitHub Release:
 
-Please report security issues via `SECURITY.md`.
+```bash
+git tag v1.0.1
+git push origin v1.0.1
+```
 
-## License
+Pre-built binaries will be available in the Releases page.
 
-Apache-2.0. See `LICENSE`.
+---
+
+## 🤝 Contributing
+
+We welcome contributions! Please read:
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) - Contribution guidelines
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) - Code of conduct
+
+---
+
+## 🔒 Security
+
+For security issues, please refer to [SECURITY.md](SECURITY.md).
+
+---
+
+## 📄 License
+
+Apache-2.0. See [LICENSE](LICENSE) for details.
+
+---
+
+## 🙏 Acknowledgments
+
+- [Tokio](https://tokio.rs/) - Async runtime
+- [hickory-dns](https://github.com/hickory-dns/hickory-dns) - DNS protocol library
+- [sing-box](https://github.com/SagerNet/sing-box) - FakeIP integration
+- [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat) - GeoSite/GeoIP rules

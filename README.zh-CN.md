@@ -1,154 +1,220 @@
-# TitanDNS
+<p align="center">
+  <img src="www/logo.svg" alt="TitanDNS Logo" width="120" height="120">
+</p>
 
-中文 | [English](README.md)
+<h1 align="center">TitanDNS</h1>
 
-TitanDNS 是一个基于 Rust 的高性能 DNS 转发器，支持 Linux 下的可选 eBPF 加速。
-本仓库发布自 `online` 分支，仅包含对外开源的最小源码集：
-`src/`、`bpf/`、`www/`、`Cargo.toml`。
+<p align="center">
+  <b>新一代高性能 DNS 转发器，基于 Rust 和 eBPF 构建</b>
+</p>
 
-## 项目特点
+<p align="center">
+  <a href="https://github.com/jimmyzhou521-stack/TitanDns/actions"><img src="https://github.com/jimmyzhou521-stack/TitanDns/actions/workflows/build.yml/badge.svg" alt="构建状态"></a>
+  <a href="https://github.com/jimmyzhou521-stack/TitanDns/releases"><img src="https://img.shields.io/github/v/release/jimmyzhou521-stack/TitanDns" alt="版本"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="许可证"></a>
+</p>
 
-- 高性能异步核心（Tokio）
-- 插件化链路：缓存、策略、Geo 规则、上游路由
-- 配置热更新
-- 可选 eBPF 快路径加速（Linux）
-- Web UI 资源（`www/`）
-- 指标体系友好（Prometheus）
+<p align="center">
+  中文 | <a href="README.md">English</a>
+</p>
 
-## 典型场景
+---
 
-- 家庭 / 自建网络的智能分流 DNS
-- 企业边缘 DNS 转发与缓存
-- 多上游 DoH/DoT 转发与策略控制
+## ✨ 功能特性
 
-## 架构（简化流程）
+### 🚀 极致性能
 
-1. 接收 DNS 请求（UDP/TCP/DoH）
-2. 预处理与标准化
-3. 执行插件序列（缓存 / 规则 / Geo / 上游）
-4. 生成响应 + 可选缓存
-5. 输出响应 + 指标采集
+- **高性能异步核心**：基于 Tokio 运行时构建
+- **可选 eBPF/XDP 加速**：内核级 DNS 缓存，500万+ QPS
+- **零拷贝解析**：优化内存分配
+- **批量 I/O**：支持高吞吐场景
 
-## 编译
+### 🔧 灵活扩展
 
-依赖：
-- Rust stable 工具链
-- 如需编译 eBPF（可选），需要 Linux 内核头文件
+- **插件化架构**：缓存、策略、Geo 规则、上游路由
+- **配置热更新**：无需重启服务
+- **多协议支持**：UDP、TCP、DoH、DoT、DoQ
+- **SOCKS5 代理支持**：上游连接可走代理
 
-编译 release：
+### 🧠 智能分流
 
-```
-cargo build --release
-```
+- **智能分流路由**：自动识别国内/国外流量
+- **机器学习选择**：基于 Thompson Sampling 的上游选择
+- **学习缓存**：域名分类自动学习并持久化
+- **FakeIP 集成**：与 sing-box 无缝配合透明代理
 
-## 运行
+### 🛡️ 安全防护
 
-你需要提供自己的配置文件（配置文件不在仓库中）：
+- **DNSSEC 验证**：支持 DNS 安全扩展
+- **DGA 检测**：识别恶意软件生成的随机域名
+- **AdGuard 广告拦截**：兼容 AdGuard 规则语法
+- **速率限制**：防止 DNS 放大攻击
 
-```
-./target/release/titandns --config /path/to/config.yaml
-```
+### 📊 可观测性
 
-示例配置（脱敏）：`config.example.yaml`。
+- **内置 Web 仪表盘**：监控和管理
+- **Prometheus 指标**：无缝对接监控系统
+- **详细查询日志**：包含拦截历史
 
-## 一键安装（Linux）
+---
 
-```
+## 📦 快速开始
+
+### 一键安装（Linux）
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/jimmyzhou521-stack/TitanDns/online/install.sh | bash
 ```
 
-脚本会下载最新 GitHub Release，并执行包内的 `install.sh`。
-安装完成后，请编辑 `/etc/titandns/config.yaml` 以适配环境。
+**支持平台：**
 
-支持：Linux x86_64 / x86_64-v3 / arm64（自动识别）。
+- Linux x86_64
+- Linux x86_64-v3（Intel Haswell+、AMD Zen+）
+- Linux arm64（树莓派 4、AWS Graviton）
 
-当 Release 中存在 `SHA256SUMS.txt` 时，安装脚本会自动校验。
+安装完成后，编辑 `/etc/titandns/config.yaml` 以适配你的环境。
 
-## 配置（概览）
+### 从源码编译
 
-YAML 配置通常包含：
+**前置要求：**
 
-- 全局设置：`log`、`api`、`ebpf`
-- `plugins`：插件定义（cache / forward / geo / matcher / 等）
-- `sequences`：执行链路
-- `servers`：监听器定义（UDP / TCP / HTTP）
+- Rust stable 工具链（1.70+）
+- Linux 内核头文件（可选，用于 eBPF）
 
-### 示例 1：最小 UDP + 缓存 + 上游
+```bash
+# 克隆仓库
+git clone https://github.com/jimmyzhou521-stack/TitanDns.git
+cd TitanDns
+
+# 编译 release
+cargo build --release
+
+# 运行
+./target/release/titandns --config config.example.yaml
+```
+
+---
+
+## 🏗️ 系统架构
 
 ```
-log:
-  level: "info"
+┌─────────────────────────────────────────────────────────────────┐
+│                        TitanDNS 核心                            │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐ │
+│  │   UDP    │  │   TCP    │  │   DoH    │  │   Web 仪表盘     │ │
+│  │  监听器  │  │  监听器  │  │  监听器  │  │  (端口 8080)     │ │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────────┬─────────┘ │
+│       │             │             │                  │          │
+│       └─────────────┴─────────────┴──────────────────┘          │
+│                              │                                   │
+│  ┌───────────────────────────▼───────────────────────────────┐  │
+│  │                      插件流水线                            │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────┐   │  │
+│  │  │  缓存   │→ │ GeoSite │→ │ 匹配器  │→ │ 智能分流    │   │  │
+│  │  └─────────┘  └─────────┘  └─────────┘  └─────────────┘   │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                              │                                   │
+│  ┌───────────────────────────▼───────────────────────────────┐  │
+│  │                       上游层                               │  │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐   │  │
+│  │  │ UDP/TCP  │  │   DoH    │  │   DoT    │  │   DoQ    │   │  │
+│  │  │ (直连)   │  │ (SOCKS5) │  │ (SOCKS5) │  │(SOCKS5)  │   │  │
+│  │  └──────────┘  └──────────┘  └──────────┘  └──────────┘   │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                              │                                   │
+│  ┌───────────────────────────▼───────────────────────────────┐  │
+│  │              eBPF/XDP 加速层（可选）                       │  │
+│  │             内核级 DNS 缓存，超低延迟                      │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
+---
+
+## ⚙️ 配置说明
+
+TitanDNS 使用 YAML 配置格式。完整示例请参考 `config.example.yaml`。
+
+### 配置结构
+
+```yaml
+log:           # 日志设置
+api:           # 仪表盘和 API 设置
+ebpf:          # eBPF/XDP 加速（仅 Linux）
+plugins:       # 插件定义
+sequences:     # 执行流水线
+servers:       # 监听器定义
+```
+
+### 插件类型
+
+| 插件 | 说明 |
+|------|------|
+| `cache` | 高性能 DNS 缓存，支持预取和过期服务 |
+| `forward` | 上游 DNS 转发器（UDP/TCP/DoH/DoT/DoQ）|
+| `geosite` | 基于 GeoSite 规则的域名分类 |
+| `geoip` | 基于 MaxMind MMDB 的 IP 分类 |
+| `matcher` | 域名模式匹配与标签 |
+| `smart_forward` | 智能分流路由，带自动学习 |
+| `adblock` | AdGuard 兼容的广告拦截 |
+| `dnssec` | DNSSEC 验证 |
+| `ecs` | EDNS 客户端子网注入 |
+| `ratelimit` | 查询速率限制 |
+
+### 配置示例：智能分流
+
+```yaml
 plugins:
-  cache_main:
-    type: "cache"
-    size: 100000
-    prefetch_if_ttl_less_than: 240
-    serve_stale_ttl: 120
-
-  upstream_default:
-    type: "forward"
-    strategy: "smart"
-    timeout_ms: 2000
-    upstreams:
-      - addr: "udp://1.1.1.1:53"
-
-sequences:
-  sequence_main:
-    - exec: cache_main
-    - exec: upstream_default
-
-servers:
-  - protocol: udp
-    addr: "0.0.0.0:53"
-    entry: sequence_main
-```
-
-### 示例 2：国内/代理分流
-
-```
-plugins:
+  # 国内缓存
   cache_domestic:
     type: "cache"
     size: 100000
 
+  # 代理缓存（FakeIP）
   cache_proxy:
     type: "cache"
     size: 100000
+    fakeip_protection: true
 
+  # 国内上游
   upstream_local:
     type: "forward"
-    strategy: "smart"
+    strategy: "race"
     upstreams:
-      - addr: "udp://223.5.5.5:53"
-      - addr: "udp://119.29.29.29:53"
+      - addr: "udp://223.5.5.5:53"     # 阿里 DNS
+      - addr: "udp://119.29.29.29:53"  # DNSPod
 
+  # FakeIP 上游（sing-box）
   upstream_fakeip:
     type: "forward"
-    strategy: "smart"
     upstreams:
-      - addr: "https://1.1.1.1/dns-query"
-        socks5: "127.0.0.1:7891"
+      - addr: "udp://127.0.0.1:6666"
 
+  # GeoSite 规则
   geosite_cn:
     type: "geosite"
-    file: "/etc/titandns/geosite_cn.txt"
-    tag: "cn"
+    target: "cn"
+    files:
+      - "/etc/titandns/geosite.dat:cn"
+    mark: "cn"
 
-  matcher_proxy:
-    type: "matcher"
-    file: "/etc/titandns/greylist.txt"
-    tag: "proxy"
+  geosite_proxy:
+    type: "geosite"
+    target: "proxy"
+    files:
+      - "/etc/titandns/geosite.dat:gfw"
+    mark: "proxy"
 
 sequences:
   sequence_main:
     - exec: geosite_cn
-    - exec: matcher_proxy
-    - matches: [{ has_tag: "proxy" }]
-      exec: sequence_proxy
+    - exec: geosite_proxy
     - matches: [{ has_tag: "cn" }]
       exec: sequence_local
-    - exec: upstream_local  # fallback
+    - matches: [{ has_tag: "proxy" }]
+      exec: sequence_proxy
+    - exec: smart_splitter  # 兜底智能分流
 
   sequence_local:
     - exec: cache_domestic
@@ -157,68 +223,77 @@ sequences:
   sequence_proxy:
     - exec: cache_proxy
     - exec: upstream_fakeip
-
-servers:
-  - protocol: udp
-    addr: "0.0.0.0:53"
-    entry: sequence_main
 ```
 
-### 示例 3：DoH / DoT 上游
+---
 
-```
-plugins:
-  upstream_secure:
-    type: "forward"
-    strategy: "smart"
-    timeout_ms: 5000
-    upstreams:
-      - addr: "https://1.1.1.1/dns-query"
-        socks5: "127.0.0.1:7891"
-      - addr: "tls://1.1.1.1:853"
-        socks5: "127.0.0.1:7891"
-```
+## 📊 Web 仪表盘
 
-### 示例 4：eBPF（Linux）
+TitanDNS 内置 Web 仪表盘，用于监控和管理。
 
-```
-ebpf:
-  interface: "eth0"
-  bpf_path: "/etc/titandns/titan_dns_filter.o"
-  xdp_cache:
-    enabled: true
-    size: 1000000
-```
+**访问地址：** `http://你的服务器:8080`
 
-## Web UI
+功能：
 
-`www/` 中包含静态资源，你可以使用自己的 Web 服务器托管，或在配置中开启
-TitanDNS 的 HTTP 服务进行集成。
+- 实时查询统计
+- 上游健康监控
+- 缓存命中率可视化
+- 最近拦截记录
+- 配置管理
 
-## CI / 构建产物
+---
 
-每次 push 到 `online`，GitHub Actions 会构建 release 并上传打包产物
-（包含 `titandns` + `www/` + `bpf/`）。产物命名：
-`titandns-<版本>-<日期>-<系统>.tar.gz`，其中 `<版本>` 来自 `Cargo.toml`，
-`<日期>` 格式为 `YYYYMMDD`。
+## 🔧 规则更新
 
-## 发布（Tag）
+使用内置脚本自动更新 GeoSite、GeoIP 和 AdBlock 规则：
 
-创建并推送标签（例如 `v1.0.0`）会触发 GitHub Release：
+```bash
+# 手动更新
+/etc/titandns/update_rules.sh
 
-```
-git tag v1.0.0
-git push origin v1.0.0
+# 安装每日自动更新（凌晨 02:00）
+/etc/titandns/update_rules.sh --install
 ```
 
-## 贡献
+---
 
-请先阅读 `CONTRIBUTING.md`，并遵守 `CODE_OF_CONDUCT.md`。
+## 🏷️ 版本发布
 
-## 安全
+创建并推送 git 标签以触发 GitHub Release：
 
-安全问题请参考 `SECURITY.md`。
+```bash
+git tag v1.0.1
+git push origin v1.0.1
+```
 
-## 许可
+预编译二进制文件将在 Releases 页面提供。
 
-Apache-2.0，详见 `LICENSE`。
+---
+
+## 🤝 贡献指南
+
+欢迎贡献！请阅读：
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) - 贡献指南
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) - 行为准则
+
+---
+
+## 🔒 安全
+
+安全问题请参考 [SECURITY.md](SECURITY.md)。
+
+---
+
+## 📄 许可证
+
+Apache-2.0，详见 [LICENSE](LICENSE)。
+
+---
+
+## 🙏 致谢
+
+- [Tokio](https://tokio.rs/) - 异步运行时
+- [hickory-dns](https://github.com/hickory-dns/hickory-dns) - DNS 协议库
+- [sing-box](https://github.com/SagerNet/sing-box) - FakeIP 集成
+- [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat) - GeoSite/GeoIP 规则
