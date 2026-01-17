@@ -11,6 +11,7 @@
 <p align="center">
   <a href="https://github.com/jimmyzhou521-stack/TitanDns/actions"><img src="https://github.com/jimmyzhou521-stack/TitanDns/actions/workflows/build.yml/badge.svg" alt="Build Status"></a>
   <a href="https://github.com/jimmyzhou521-stack/TitanDns/releases"><img src="https://img.shields.io/github/v/release/jimmyzhou521-stack/TitanDns" alt="Release"></a>
+  <a href="https://github.com/jimmyzhou521-stack/TitanDns/releases"><img src="https://img.shields.io/github/downloads/jimmyzhou521-stack/TitanDns/total" alt="Downloads"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
 </p>
 
