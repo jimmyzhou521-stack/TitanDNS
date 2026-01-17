@@ -6,7 +6,7 @@ use hickory_proto::op::Message;
 use hickory_proto::serialize::binary::{BinEncoder, BinEncodable};
 use tracing::{debug, info, warn};
 use dashmap::DashMap;  // For Shadow Refresh reverse mapping
-use lazy_static::lazy_static;
+use once_cell::sync::OnceCell;
 
 use crate::core::context::Context;
 use crate::core::plugin::Plugin;
@@ -22,12 +22,17 @@ use ipnet::IpNet;
 
 // Global XDP Hash Map: qhash -> (domain, qtype, qclass)
 // Shared across all CachePlugin instances to avoid duplicate syncs
-// Using Moka Sync Cache for automatic TTL (2h) and LRU eviction (500k entries) to prevent memory leaks
-lazy_static! {
-    static ref GLOBAL_XDP_HASH_MAP: moka::sync::Cache<u64, (String, u16, u16)> = moka::sync::Cache::builder()
-        .max_capacity(500_000)
-        .time_to_live(std::time::Duration::from_secs(7200)) // 2 hours TTL
-        .build();
+static GLOBAL_XDP_HASH_MAP: OnceCell<moka::sync::Cache<u64, (String, u16, u16)>> = OnceCell::new();
+
+fn get_global_xdp_hash_map(ttl_secs: u64) -> moka::sync::Cache<u64, (String, u16, u16)> {
+    GLOBAL_XDP_HASH_MAP
+        .get_or_init(|| {
+            moka::sync::Cache::builder()
+                .max_capacity(500_000)
+                .time_to_live(std::time::Duration::from_secs(ttl_secs))
+                .build()
+        })
+        .clone()
 }
 
 // Composite Key for Cache Lookup (optimized with u64 hash and ECS awareness)
@@ -106,6 +111,36 @@ impl QueryKey {
     }
 }
 
+const DEFAULT_MOKA_TTL_SECS: u64 = 86400 * 7;
+const DEFAULT_XDP_HASH_TTL_SECS: u64 = 7200;
+const DEFAULT_PREFETCH_CONCURRENT: usize = 2;
+const DEFAULT_PREFETCH_TIMEOUT_MS: u64 = 2000;
+const DEFAULT_MIN_TTL: u64 = 0;
+const DEFAULT_MAX_TTL: u64 = 86400;
+
+#[derive(Debug, Clone)]
+pub struct CacheTuning {
+    pub min_ttl: u64,
+    pub max_ttl: u64,
+    pub moka_ttl_secs: u64,
+    pub xdp_hash_ttl_secs: u64,
+    pub prefetch_concurrent: usize,
+    pub prefetch_timeout_ms: u64,
+}
+
+impl Default for CacheTuning {
+    fn default() -> Self {
+        Self {
+            min_ttl: DEFAULT_MIN_TTL,
+            max_ttl: DEFAULT_MAX_TTL,
+            moka_ttl_secs: DEFAULT_MOKA_TTL_SECS,
+            xdp_hash_ttl_secs: DEFAULT_XDP_HASH_TTL_SECS,
+            prefetch_concurrent: DEFAULT_PREFETCH_CONCURRENT,
+            prefetch_timeout_ms: DEFAULT_PREFETCH_TIMEOUT_MS,
+        }
+    }
+}
+
 // CachePlugin - Custom Debug implementation to skip non-Debug fields
 pub struct CachePlugin {
     pub name: String,
@@ -132,7 +167,7 @@ pub struct CachePlugin {
     #[cfg(target_os = "linux")]
     xdp_filter: Option<Arc<tokio::sync::Mutex<crate::bpf::DnsBpfFilter>>>,
     xdp_cache_enabled: bool,
-    // Note: xdp_hash_map is now GLOBAL_XDP_HASH_MAP (shared across all instances)
+    xdp_hash_map: moka::sync::Cache<u64, (String, u16, u16)>,
 }
 
 impl std::fmt::Debug for CachePlugin {
@@ -175,9 +210,29 @@ impl CachedEntry {
         }
     }
 
+    fn new_with_bytes(message: Message, ttl: u64, raw_bytes: bytes::Bytes) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        Self {
+            message: Arc::new(message),
+            raw_bytes: Some(raw_bytes),
+            timestamp: now,
+            ttl,
+        }
+    }
+
     // Convert to binary for persistence
     fn to_bytes(&self) -> Result<Vec<u8>> {
-        let msg_bytes = self.message.as_ref().to_vec()?;
+        let owned;
+        let msg_bytes: &[u8] = if let Some(ref raw) = self.raw_bytes {
+            raw.as_ref()
+        } else {
+            owned = self.message.as_ref().to_vec()?;
+            owned.as_ref()
+        };
         let mut buf = Vec::with_capacity(8 + 8 + 4 + msg_bytes.len());
         buf.extend_from_slice(&self.timestamp.to_le_bytes());
         buf.extend_from_slice(&self.ttl.to_le_bytes());
@@ -208,23 +263,36 @@ impl CachedEntry {
 }
 
 impl CachePlugin {
-    pub fn new(size: u64, 
+    pub fn new(size: u64,
                prefetch_conf: Option<(Vec<UpstreamConfig>, u32, u32)>,
                recursive_backend: Option<Arc<RecursiveBackend>>,
                persist_file: Option<String>,
-               persist_interval: u64) -> Self {
+               persist_interval: u64,
+               tuning: CacheTuning,
+               prefetch_strategy: Option<String>,
+               prefetch_timeout_ms: Option<u64>) -> Self {
         // Init Moka Cache
         let cache: Cache<QueryKey, CachedEntry> = Cache::builder()
             .max_capacity(size)
-            .time_to_live(Duration::from_secs(86400 * 7)) // Store for a week (we handle TTL manually)
+            .time_to_live(Duration::from_secs(tuning.moka_ttl_secs))
             .build();
+
+        let xdp_hash_map = get_global_xdp_hash_map(tuning.xdp_hash_ttl_secs);
 
         let (mut forwarder, mut threshold, mut stale_ttl) = (None, 0, 0);
         
         if let Some((upstreams, th, st)) = prefetch_conf {
             if !upstreams.is_empty() {
+                let effective_timeout_ms = prefetch_timeout_ms.unwrap_or(tuning.prefetch_timeout_ms);
                 debug!("⚡ Smart Prefetch ENABLED (Threshold: {}s, Stale: {}s) with {} upstreams", th, st, upstreams.len());
-                forwarder = Some(Arc::new(ForwardPlugin::new("cache_prefetch".to_string(), upstreams, None, 2)));
+                forwarder = Some(Arc::new(ForwardPlugin::new(
+                    "cache_prefetch".to_string(),
+                    upstreams,
+                    prefetch_strategy.clone(),
+                    tuning.prefetch_concurrent,
+                    effective_timeout_ms,
+                    crate::plugins::forward::ForwardTuning::default(),
+                )));
                 threshold = th as u64;
                 stale_ttl = st as u64;
             }
@@ -233,8 +301,8 @@ impl CachePlugin {
         let plugin = Self {
             name: "cache".to_string(),
             cache,
-            min_ttl: 0,
-            max_ttl: 86400,
+            min_ttl: tuning.min_ttl,
+            max_ttl: tuning.max_ttl,
             fakeip_protection: false,  // 默认关闭
             prefetch_forwarder: forwarder,
             prefetch_recursive: recursive_backend,
@@ -246,6 +314,7 @@ impl CachePlugin {
             #[cfg(target_os = "linux")]
             xdp_filter: None,  // Will be set via set_xdp_filter()
             xdp_cache_enabled: false,
+            xdp_hash_map,
         };
 
         // Load cache from disk on startup
@@ -447,7 +516,8 @@ impl CachePlugin {
         }
 
         let key = self.build_key_for_domain(domain, qtype, qclass);
-        let entry = CachedEntry::new(resp.clone(), ttl);
+        let raw_bytes = bytes::Bytes::from(response_bytes);
+        let entry = CachedEntry::new_with_bytes(resp.clone(), ttl, raw_bytes.clone());
         self.cache.insert(key, entry).await;
 
         // Sync to XDP kernel cache if enabled
@@ -458,7 +528,7 @@ impl CachePlugin {
             if let Ok(name) = Name::from_ascii(domain) {
                 let mut encoder = BinEncoder::new(&mut qname_raw);
                 if name.emit(&mut encoder).is_ok() {
-                    self.sync_to_xdp(&qname_raw, qtype, qclass, domain, &resp, ttl).await;
+                    self.sync_to_xdp(&qname_raw, qtype, qclass, domain, raw_bytes.as_ref(), ttl).await;
                 }
             }
         }
@@ -566,11 +636,10 @@ impl CachePlugin {
         info!("⚡ XDP Cache filter attached to CachePlugin: {}", self.name);
 
         // Clone self fields for the background task
-        // Clone self fields for the background task
         let filter_clone = filter.clone();
-        // Global Hash Map is used directly
         let prefetch_recursive = self.prefetch_recursive.clone();
         let cache_clone = self.cache.clone();
+        let xdp_hash_map = self.xdp_hash_map.clone();
         let xdp_enabled = self.xdp_cache_enabled;
         let plugin_name = self.name.clone();
 
@@ -614,7 +683,7 @@ impl CachePlugin {
                         }
                         
                         // Look up domain info from reverse mapping
-                        if let Some((domain, qtype, qclass)) = GLOBAL_XDP_HASH_MAP.get(&qhash) {
+                        if let Some((domain, qtype, qclass)) = xdp_hash_map.get(&qhash) {
                             debug!("🔄 Shadow Refresh event: {} (type={})", domain, qtype);
                             
                             // Trigger background refresh
@@ -634,6 +703,27 @@ impl CachePlugin {
                                                 .min()
                                                 .unwrap_or(300);
                                             
+                                            let response_bytes = match response.to_vec() {
+                                                Ok(b) => b,
+                                                Err(e) => {
+                                                    warn!("❌ Shadow Refresh encode failed for {}: {}", domain_clone, e);
+                                                    return;
+                                                }
+                                            };
+                                            let raw_bytes = bytes::Bytes::from(response_bytes);
+                                            
+                                            let qname_raw = if let Some(query) = response.queries().first() {
+                                                let mut qname_raw = Vec::new();
+                                                let mut encoder = BinEncoder::new(&mut qname_raw);
+                                                if hickory_proto::serialize::binary::BinEncodable::emit(query.name(), &mut encoder).is_ok() {
+                                                    Some(qname_raw)
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None
+                                            };
+                                            
                                             // Update Moka cache
                                             let mut hasher = SimdDomainHasher::new();
                                             let name_hash = hasher.hash_domain(&domain_clone);
@@ -643,21 +733,15 @@ impl CachePlugin {
                                                 qclass,
                                                 subnet: None,
                                             };
-                                            let entry = CachedEntry::new(response.clone(), ttl as u64);
+                                            let entry = CachedEntry::new_with_bytes(response, ttl as u64, raw_bytes.clone());
                                             cache_for_refresh.insert(key, entry).await;
                                             
                                             // Update XDP cache
                                             if xdp_enabled {
-                                                if let Some(query) = response.queries().first() {
-                                                    let mut qname_raw = Vec::new();
-                                                    let mut encoder = BinEncoder::new(&mut qname_raw);
-                                                    if hickory_proto::serialize::binary::BinEncodable::emit(query.name(), &mut encoder).is_ok() {
-                                                        if let Ok(response_bytes) = hickory_proto::serialize::binary::BinEncodable::to_bytes(&response) {
-                                                            let mut guard = filter_for_refresh.lock().await;
-                                                            if guard.update_cache(&qname_raw, qtype, qclass, &response_bytes, ttl as u64).is_ok() {
-                                                                debug!("✅ Shadow Refresh updated: {} (TTL: {}s)", domain_clone, ttl);
-                                                            }
-                                                        }
+                                                if let Some(qname_raw) = qname_raw {
+                                                    let mut guard = filter_for_refresh.lock().await;
+                                                    if guard.update_cache(&qname_raw, qtype, qclass, raw_bytes.as_ref(), ttl as u64).is_ok() {
+                                                        debug!("✅ Shadow Refresh updated: {} (TTL: {}s)", domain_clone, ttl);
                                                     }
                                                 }
                                             }
@@ -707,9 +791,10 @@ impl CachePlugin {
         if self.xdp_cache_enabled {
             let cache_clone = self.cache.clone();
             let filter_for_warmup = filter.clone();
+            let xdp_hash_map = self.xdp_hash_map.clone();
             
             tokio::spawn(async move {
-                Self::warm_xdp_cache_async(cache_clone, filter_for_warmup).await;
+                Self::warm_xdp_cache_async(cache_clone, filter_for_warmup, xdp_hash_map).await;
             });
         }
     }
@@ -730,7 +815,7 @@ impl CachePlugin {
     #[cfg(target_os = "linux")]
     pub fn trigger_shadow_refresh(&self, qhash: u64) {
         // Look up domain info from reverse mapping
-        if let Some((domain, qtype, qclass)) = GLOBAL_XDP_HASH_MAP.get(&qhash) {
+        if let Some((domain, qtype, qclass)) = self.xdp_hash_map.get(&qhash) {
             info!("🔄 Shadow Refresh triggered for {} (type={})", domain, qtype);
             
             // Trigger background refresh using prefetch mechanism
@@ -739,6 +824,7 @@ impl CachePlugin {
                 let cache_clone = self.cache.clone();
                 let xdp_filter = self.xdp_filter.clone();
                 let xdp_enabled = self.xdp_cache_enabled;
+                let xdp_hash_map = self.xdp_hash_map.clone();
                 let domain_clone = domain.clone();
                 
                 tokio::spawn(async move {
@@ -752,6 +838,27 @@ impl CachePlugin {
                                 .min()
                                 .unwrap_or(300);
                             
+                            let response_bytes = match response.to_vec() {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    warn!("❌ Shadow Refresh encode failed for {}: {}", domain_clone, e);
+                                    return;
+                                }
+                            };
+                            let raw_bytes = bytes::Bytes::from(response_bytes);
+                            
+                            let qname_raw = if let Some(query) = response.queries().first() {
+                                let mut qname_raw = Vec::new();
+                                let mut encoder = BinEncoder::new(&mut qname_raw);
+                                if hickory_proto::serialize::binary::BinEncodable::emit(query.name(), &mut encoder).is_ok() {
+                                    Some(qname_raw)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            
                             // Update Moka cache
                             let mut hasher = SimdDomainHasher::new();
                             let name_hash = hasher.hash_domain(&domain_clone);
@@ -761,26 +868,20 @@ impl CachePlugin {
                                 qclass,
                                 subnet: None,
                             };
-                            let entry = CachedEntry::new(response.clone(), ttl as u64);
+                            let entry = CachedEntry::new_with_bytes(response, ttl as u64, raw_bytes.clone());
                             cache_clone.insert(key, entry).await;
                             
                             // Update XDP cache
                             if xdp_enabled {
                                 if let Some(filter) = xdp_filter {
                                     // Re-encode domain to wire format
-                                    if let Some(query) = response.queries().first() {
-                                        let mut qname_raw = Vec::new();
-                                        let mut encoder = BinEncoder::new(&mut qname_raw);
-                                        if hickory_proto::serialize::binary::BinEncodable::emit(query.name(), &mut encoder).is_ok() {
-                                            if let Ok(response_bytes) = hickory_proto::serialize::binary::BinEncodable::to_bytes(&response) {
-                                                let mut guard = filter.lock().await;
-                                                if guard.update_cache(&qname_raw, qtype, qclass, &response_bytes, ttl as u64).is_ok() {
-                                                    // Update reverse mapping
-                                                    let new_hash = Self::calculate_xdp_hash(&qname_raw, qtype, qclass);
-                                                    GLOBAL_XDP_HASH_MAP.insert(new_hash, (domain_clone.clone(), qtype, qclass));
-                                                    debug!("✅ Shadow Refresh updated: {} (TTL: {}s)", domain_clone, ttl);
-                                                }
-                                            }
+                                    if let Some(qname_raw) = qname_raw {
+                                        let mut guard = filter.lock().await;
+                                        if guard.update_cache(&qname_raw, qtype, qclass, raw_bytes.as_ref(), ttl as u64).is_ok() {
+                                            // Update reverse mapping
+                                            let new_hash = Self::calculate_xdp_hash(&qname_raw, qtype, qclass);
+                                            xdp_hash_map.insert(new_hash, (domain_clone.clone(), qtype, qclass));
+                                            debug!("✅ Shadow Refresh updated: {} (TTL: {}s)", domain_clone, ttl);
                                         }
                                     }
                                 }
@@ -797,7 +898,7 @@ impl CachePlugin {
 
     /// Sync a cache entry to XDP kernel cache
     #[cfg(target_os = "linux")]
-    async fn sync_to_xdp(&self, qname_raw: &[u8], qtype: u16, qclass: u16, domain: &str, response: &Message, ttl: u64) {
+    async fn sync_to_xdp(&self, qname_raw: &[u8], qtype: u16, qclass: u16, domain: &str, response_bytes: &[u8], ttl: u64) {
         if !self.xdp_cache_enabled { return; }
 
         if let Some(ref filter) = self.xdp_filter {
@@ -805,20 +906,18 @@ impl CachePlugin {
             let qhash = Self::calculate_xdp_hash(qname_raw, qtype, qclass);
             
             // Skip if already synced by another cache plugin (deduplication)
-            if GLOBAL_XDP_HASH_MAP.contains_key(&qhash) {
+            if self.xdp_hash_map.contains_key(&qhash) {
                 debug!("🔄 XDP Sync skipped (already exists): h={:x}", qhash);
                 return;
             }
             
-            if let Ok(response_bytes) = response.to_vec() {
-                let mut guard = filter.lock().await;
+            let mut guard = filter.lock().await;
 
-                if let Err(e) = guard.update_cache(qname_raw, qtype, qclass, &response_bytes, ttl) {
-                    debug!("XDP cache update failed: {}", e);
-                } else {
-                    // Save reverse mapping for Shadow Refresh
-                    GLOBAL_XDP_HASH_MAP.insert(qhash, (domain.to_string(), qtype, qclass));
-                }
+            if let Err(e) = guard.update_cache(qname_raw, qtype, qclass, response_bytes, ttl) {
+                debug!("XDP cache update failed: {}", e);
+            } else {
+                // Save reverse mapping for Shadow Refresh
+                self.xdp_hash_map.insert(qhash, (domain.to_string(), qtype, qclass));
             }
         }
     }
@@ -860,6 +959,7 @@ impl CachePlugin {
     async fn warm_xdp_cache_async(
         cache: Cache<QueryKey, CachedEntry>,
         filter: Arc<tokio::sync::Mutex<crate::bpf::DnsBpfFilter>>,
+        xdp_hash_map: moka::sync::Cache<u64, (String, u16, u16)>,
     ) {
         use hickory_proto::serialize::binary::BinEncoder;
         use hickory_proto::serialize::binary::BinEncodable;
@@ -905,19 +1005,27 @@ impl CachePlugin {
             let qtype: u16 = query.query_type().into();
             let qclass: u16 = query.query_class().into();
 
-            // Serialize response
-            let response_bytes = match entry.message.as_ref().to_vec() {
-                Ok(b) => b,
-                Err(_) => {
-                    skipped_count += 1;
-                    continue;
+            // Serialize response (prefer cached raw bytes)
+            let owned;
+            let response_bytes: &[u8] = if let Some(ref raw) = entry.raw_bytes {
+                raw.as_ref()
+            } else {
+                match entry.message.as_ref().to_vec() {
+                    Ok(b) => {
+                        owned = b;
+                        owned.as_ref()
+                    }
+                    Err(_) => {
+                        skipped_count += 1;
+                        continue;
+                    }
                 }
             };
 
             // Update XDP cache (with lock)
             {
                 let mut guard = filter.lock().await;
-                if let Err(e) = guard.update_cache(&qname_raw, qtype, qclass, &response_bytes, remaining_ttl) {
+                if let Err(e) = guard.update_cache(&qname_raw, qtype, qclass, response_bytes, remaining_ttl) {
                     debug!("XDP warmup entry failed: {}", e);
                     skipped_count += 1;
                     continue;
@@ -926,7 +1034,7 @@ impl CachePlugin {
                 // Update reverse mapping for Shadow Refresh
                 let qhash = Self::calculate_xdp_hash(&qname_raw, qtype, qclass);
                 let domain = query.name().to_string();
-                GLOBAL_XDP_HASH_MAP.insert(qhash, (domain, qtype, qclass));
+                xdp_hash_map.insert(qhash, (domain, qtype, qclass));
             }
 
             synced_count += 1;
@@ -1035,7 +1143,15 @@ impl Plugin for CachePlugin {
                                      Ok(msg) => {
                                          let ttl = myself.calculate_ttl(&msg);
                                          if ttl > 0 {
-                                             let entry = CachedEntry::new(msg, ttl);
+                                             let msg_bytes = match msg.to_vec() {
+                                                 Ok(b) => b,
+                                                 Err(e) => {
+                                                     warn!("⚠️ Recursive refresh encode failed for {}: {}", name_str, e);
+                                                     return;
+                                                 }
+                                             };
+                                             let raw_bytes = bytes::Bytes::from(msg_bytes);
+                                             let entry = CachedEntry::new_with_bytes(msg, ttl, raw_bytes);
                                              cache_clone.insert(key_clone, entry).await;
                                              debug!("✅ Recursive refresh UPDATED: {} (TTL: {}s)", name_str, ttl);
                                          }
@@ -1049,7 +1165,15 @@ impl Plugin for CachePlugin {
                                                       Ok(resp) => {
                                                           let ttl = myself.calculate_ttl(&resp);
                                                           if ttl > 0 {
-                                                              let entry = CachedEntry::new(resp, ttl);
+                                                              let resp_bytes = match resp.to_vec() {
+                                                                  Ok(b) => b,
+                                                                  Err(e) => {
+                                                                      warn!("⚠️ Fallback refresh encode failed for {}: {}", name_str, e);
+                                                                      return;
+                                                                  }
+                                                              };
+                                                              let raw_bytes = bytes::Bytes::from(resp_bytes);
+                                                              let entry = CachedEntry::new_with_bytes(resp, ttl, raw_bytes);
                                                               cache_clone.insert(key_clone.clone(), entry).await; // key_clone was moved? No, Copy? QueriesKey is Clone.
                                                               debug!("🔄 Fallback refresh UPDATED: {} (TTL: {}s)", name_str, ttl);
                                                           }
@@ -1077,7 +1201,15 @@ impl Plugin for CachePlugin {
                                   Ok(resp) => {
                                       let ttl = myself.calculate_ttl(&resp);
                                       if ttl > 0 {
-                                          let entry = CachedEntry::new(resp, ttl);
+                                          let resp_bytes = match resp.to_vec() {
+                                              Ok(b) => b,
+                                              Err(e) => {
+                                                  warn!("⚠️ Prefetch encode failed for hash={:x}: {}", key_clone.name_hash, e);
+                                                  return;
+                                              }
+                                          };
+                                          let raw_bytes = bytes::Bytes::from(resp_bytes);
+                                          let entry = CachedEntry::new_with_bytes(resp, ttl, raw_bytes);
                                           cache_clone.insert(key_clone.clone(), entry).await;
                                           debug!("⚡ Prefetch UPDATED hash={:x} (New TTL: {}s)", key_clone.name_hash, ttl);
                                       }
@@ -1129,7 +1261,8 @@ impl Plugin for CachePlugin {
             if ttl > 0 {
                 debug!("💾 Caching response (TTL: {}s)", ttl);
                 // 使用 CachedEntry 包装，记录插入时间和 TTL
-                let entry = CachedEntry::new(resp.clone(), ttl);
+                let raw_bytes = bytes::Bytes::from(response_bytes);
+                let entry = CachedEntry::new_with_bytes(resp.clone(), ttl, raw_bytes.clone());
                 self.cache.insert(key.clone(), entry).await;
                 
                 // Sync hot entries to XDP kernel cache
@@ -1141,7 +1274,7 @@ impl Plugin for CachePlugin {
                         let qtype: u16 = query.query_type().into();
                         let qclass: u16 = query.query_class().into();
                         let domain = query.name().to_string();
-                        self.sync_to_xdp(&qname_raw, qtype, qclass, &domain, resp, ttl).await;
+                        self.sync_to_xdp(&qname_raw, qtype, qclass, &domain, raw_bytes.as_ref(), ttl).await;
                     }
                 }
             }
@@ -1169,6 +1302,7 @@ impl Clone for CachePlugin {
             #[cfg(target_os = "linux")]
             xdp_filter: self.xdp_filter.clone(),
             xdp_cache_enabled: self.xdp_cache_enabled,
+            xdp_hash_map: self.xdp_hash_map.clone(),
         }
     }
 }

@@ -9,18 +9,20 @@
 // - Predictive failover before actual failure
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::path::PathBuf;
+use std::borrow::Cow;
 use parking_lot::RwLock;
 
 use tracing::{debug, info, warn};
 use dashmap::DashMap;
 use chrono::Timelike;
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy, OnceCell};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 /// Maximum history samples to keep for each upstream
 const HISTORY_SIZE: usize = 100;
@@ -142,6 +144,9 @@ const RECOVERY_COOLDOWN: Duration = Duration::from_secs(30);
 /// Probe interval for active health checks
 const PROBE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Global epoch for upstream score changes (ranking cache invalidation)
+static UPSTREAM_SCORE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 /// AutoPilot persistence
 const AUTOPILOT_PERSIST_INTERVAL: Duration = Duration::from_secs(300); // 5 min
 const AUTOPILOT_PERSIST_DEFAULT_PATH: &str = "/var/lib/titandns/autopilot_state.json";
@@ -151,6 +156,16 @@ const PREFETCH_QPS_LIMIT: u64 = 300;          // current QPS guard
 const PREFETCH_AVG_QPS_30S_LIMIT: f64 = 200.0; // avg QPS guard
 const PREFETCH_COOLDOWN: Duration = Duration::from_secs(120);
 const AUTOPILOT_WEIGHT_TUNE_INTERVAL: Duration = Duration::from_secs(300); // 5 min
+
+pub(crate) fn normalize_domain_lower<'a>(domain: &'a str) -> Cow<'a, str> {
+    let d = domain.trim_end_matches('.');
+    let has_upper = d.as_bytes().iter().any(|b| b'A' <= *b && *b <= b'Z');
+    if has_upper {
+        Cow::Owned(d.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(d)
+    }
+}
 
 /// A single probe result with timestamp
 #[derive(Debug, Clone)]
@@ -332,6 +347,9 @@ impl UpstreamMetrics {
         
         // Recalculate score
         self.update_score();
+
+        // Mark upstream score epoch as changed (ranking cache invalidation)
+        UPSTREAM_SCORE_EPOCH.fetch_add(1, Ordering::Relaxed);
     }
     
     /// Get packet loss rate (0.0 - 1.0) for last 15 minutes
@@ -1332,7 +1350,7 @@ pub fn record_failure(label: &str) {
 
 /// Get the best upstream for a query
 pub fn get_best_upstream() -> Option<String> {
-    AUTOPILOT.get_top_upstream()
+    get_ranked_upstreams_cached(NetworkScope::Global).into_iter().next()
 }
 
 /// [Level 23] 混合选择：传统评分 + Bandit 探索
@@ -1365,13 +1383,48 @@ pub fn get_best_upstream_with_bandit() -> Option<String> {
     ranked.into_iter().next()
 }
 
-/// Get all upstreams sorted by score
-pub fn get_ranked_upstreams() -> Vec<String> {
-    get_ranked_upstreams_for_scope(NetworkScope::Global)
+const UPSTREAM_RANK_CACHE_TTL: Duration = Duration::from_millis(200);
+
+#[derive(Clone)]
+struct RankSnapshot {
+    ts: Instant,
+    epoch: u64,
+    ranks: Vec<String>,
 }
 
-/// Get upstreams sorted by score for a network scope
-pub fn get_ranked_upstreams_for_scope(scope: NetworkScope) -> Vec<String> {
+static RANK_SNAPSHOT_GLOBAL: Lazy<RwLock<RankSnapshot>> = Lazy::new(|| {
+    RwLock::new(RankSnapshot {
+        ts: Instant::now() - UPSTREAM_RANK_CACHE_TTL,
+        epoch: 0,
+        ranks: Vec::new(),
+    })
+});
+
+static RANK_SNAPSHOT_DOMESTIC: Lazy<RwLock<RankSnapshot>> = Lazy::new(|| {
+    RwLock::new(RankSnapshot {
+        ts: Instant::now() - UPSTREAM_RANK_CACHE_TTL,
+        epoch: 0,
+        ranks: Vec::new(),
+    })
+});
+
+static RANK_SNAPSHOT_FOREIGN: Lazy<RwLock<RankSnapshot>> = Lazy::new(|| {
+    RwLock::new(RankSnapshot {
+        ts: Instant::now() - UPSTREAM_RANK_CACHE_TTL,
+        epoch: 0,
+        ranks: Vec::new(),
+    })
+});
+
+fn snapshot_for_scope(scope: NetworkScope) -> &'static RwLock<RankSnapshot> {
+    match scope {
+        NetworkScope::Domestic => &RANK_SNAPSHOT_DOMESTIC,
+        NetworkScope::Foreign => &RANK_SNAPSHOT_FOREIGN,
+        _ => &RANK_SNAPSHOT_GLOBAL,
+    }
+}
+
+fn compute_ranked_upstreams(scope: NetworkScope) -> Vec<String> {
     let all = AUTOPILOT.get_all_upstreams();
     let mut scoped = filter_upstreams_by_scope(scope, all.clone());
     if scoped.is_empty() {
@@ -1385,6 +1438,47 @@ pub fn get_ranked_upstreams_for_scope(scope: NetworkScope) -> Vec<String> {
 
     available.sort_by(|a, b| b.1.cmp(&a.1));
     available.into_iter().map(|(label, _)| label).collect()
+}
+
+fn get_ranked_upstreams_cached(scope: NetworkScope) -> Vec<String> {
+    let snapshot = snapshot_for_scope(scope);
+    let now = Instant::now();
+    let epoch_now = UPSTREAM_SCORE_EPOCH.load(Ordering::Relaxed);
+
+    {
+        let cached = snapshot.read();
+        if now.duration_since(cached.ts) < UPSTREAM_RANK_CACHE_TTL && !cached.ranks.is_empty() {
+            return cached.ranks.clone();
+        }
+
+        // If scores haven't changed, reuse snapshot and just refresh timestamp
+        if cached.epoch == epoch_now && !cached.ranks.is_empty() {
+            drop(cached);
+            let mut cached = snapshot.write();
+            cached.ts = now;
+            return cached.ranks.clone();
+        }
+    }
+
+    let ranks = compute_ranked_upstreams(scope);
+    {
+        let mut cached = snapshot.write();
+        cached.ts = now;
+        cached.epoch = epoch_now;
+        cached.ranks = ranks.clone();
+    }
+
+    ranks
+}
+
+/// Get all upstreams sorted by score
+pub fn get_ranked_upstreams() -> Vec<String> {
+    get_ranked_upstreams_for_scope(NetworkScope::Global)
+}
+
+/// Get upstreams sorted by score for a network scope
+pub fn get_ranked_upstreams_for_scope(scope: NetworkScope) -> Vec<String> {
+    get_ranked_upstreams_cached(scope)
 }
 
 /// Get health status for all upstreams (for dashboard/API)
@@ -1647,14 +1741,20 @@ impl UpstreamMetrics {
 
 // ============== Level 1: AI 学习 - 域名级记忆 (优化版) ==============
 
-/// 域名记忆最大容量
-const MAX_DOMAIN_MEMORY: usize = 10000;
+/// 域名记忆最大容量 (动态扩容)
+const MIN_DOMAIN_MEMORY: usize = 10_000;
+const MAX_DOMAIN_MEMORY: usize = 100_000;
 
 /// 基础过期时间 (1小时)
 const DOMAIN_MEMORY_BASE_TTL: u64 = 3600;
+/// 基础 TTL 额外动态加成上限 (2小时)
+const DOMAIN_MEMORY_TTL_BOOST_MAX: u64 = 7200;
 
 /// 热门域名延长因子 (成功次数 * 系数 = 额外秒数，最大延长到24小时)
 const DOMAIN_MEMORY_HOT_FACTOR: u64 = 600; // 每成功1次多保留10分钟
+
+static DOMAIN_MEMORY_CAPACITY: AtomicUsize = AtomicUsize::new(MIN_DOMAIN_MEMORY);
+static DOMAIN_MEMORY_TTL_BOOST: AtomicU64 = AtomicU64::new(0);
 
 /// 域名记忆学习阈值（放宽以提高命中率）
 const DOMAIN_MEMORY_MAX_LATENCY_MS: u64 = 80;
@@ -1680,6 +1780,25 @@ struct DomainMemorySnapshot {
     pub avg_latency: u64,
     pub success_count: u32,
     pub age_secs: u64,
+}
+
+fn base_domain_ttl_secs() -> u64 {
+    let boost = DOMAIN_MEMORY_TTL_BOOST.load(Ordering::Relaxed);
+    DOMAIN_MEMORY_BASE_TTL.saturating_add(boost).min(DOMAIN_MEMORY_TTL_BOOST_MAX + DOMAIN_MEMORY_BASE_TTL)
+}
+
+fn update_domain_memory_params() {
+    let avg_qps = get_avg_qps(30);
+    let mut cap = MIN_DOMAIN_MEMORY + (avg_qps * 20.0) as usize;
+    if cap > MAX_DOMAIN_MEMORY {
+        cap = MAX_DOMAIN_MEMORY;
+    } else if cap < MIN_DOMAIN_MEMORY {
+        cap = MIN_DOMAIN_MEMORY;
+    }
+    DOMAIN_MEMORY_CAPACITY.store(cap, Ordering::Relaxed);
+
+    let boost = (avg_qps * 2.0) as u64;
+    DOMAIN_MEMORY_TTL_BOOST.store(boost.min(DOMAIN_MEMORY_TTL_BOOST_MAX), Ordering::Relaxed);
 }
 
 impl DomainMemory {
@@ -1730,16 +1849,20 @@ impl DomainMemory {
     
     /// 是否过期 (LRU优化: 热门域名延长保留)
     fn is_expired(&self) -> bool {
+        let base_ttl = base_domain_ttl_secs();
         // 热门域名延长保留: 每成功1次多保留10分钟，最多24小时
-        let bonus_secs = (self.success_count as u64 * DOMAIN_MEMORY_HOT_FACTOR).min(86400 - DOMAIN_MEMORY_BASE_TTL);
-        let ttl = DOMAIN_MEMORY_BASE_TTL + bonus_secs;
+        let bonus_secs = (self.success_count as u64 * DOMAIN_MEMORY_HOT_FACTOR)
+            .min(86400 - base_ttl);
+        let ttl = base_ttl + bonus_secs;
         self.last_update.elapsed() > Duration::from_secs(ttl)
     }
     
     /// 获取有效期剩余时间 (用于LRU排序)
     fn remaining_ttl(&self) -> i64 {
-        let bonus_secs = (self.success_count as u64 * DOMAIN_MEMORY_HOT_FACTOR).min(86400 - DOMAIN_MEMORY_BASE_TTL);
-        let ttl = DOMAIN_MEMORY_BASE_TTL + bonus_secs;
+        let base_ttl = base_domain_ttl_secs();
+        let bonus_secs = (self.success_count as u64 * DOMAIN_MEMORY_HOT_FACTOR)
+            .min(86400 - base_ttl);
+        let ttl = base_ttl + bonus_secs;
         ttl as i64 - self.last_update.elapsed().as_secs() as i64
     }
     
@@ -1752,48 +1875,159 @@ impl DomainMemory {
 /// 全局域名记忆表
 static DOMAIN_MEMORY: Lazy<DashMap<String, DomainMemory>> = Lazy::new(DashMap::new);
 
-/// 记录域名查询结果（AI 学习）
-pub fn record_domain_result(domain: &str, upstream: &str, latency_ms: u64) {
-    // 只记录快速响应（阈值内），避免记录慢速查询
-    if latency_ms > DOMAIN_MEMORY_MAX_LATENCY_MS {
-        return;
+#[derive(Debug, Clone)]
+enum LearningUpdate {
+    Global {
+        domain: String,
+        upstream: String,
+        latency_ms: u64,
+    },
+    Client {
+        key: String,
+        domain: String,
+        upstream: String,
+        latency_ms: u64,
+    },
+}
+
+static LEARNING_TX: OnceCell<mpsc::Sender<LearningUpdate>> = OnceCell::new();
+
+fn get_learning_tx() -> Option<mpsc::Sender<LearningUpdate>> {
+    if let Some(tx) = LEARNING_TX.get() {
+        return Some(tx.clone());
     }
-    
-    // 规范化域名（转小写）
-    let domain_lower = domain.to_lowercase();
-    
-    if let Some(mut entry) = DOMAIN_MEMORY.get_mut(&domain_lower) {
+
+    if tokio::runtime::Handle::try_current().is_err() {
+        return None;
+    }
+
+    let (tx, mut rx) = mpsc::channel::<LearningUpdate>(4096);
+    if LEARNING_TX.set(tx.clone()).is_ok() {
+        tokio::spawn(async move {
+            let mut buffer: Vec<LearningUpdate> = Vec::with_capacity(512);
+            let mut ticker = tokio::time::interval(Duration::from_millis(200));
+            loop {
+                tokio::select! {
+                    update = rx.recv() => {
+                        if let Some(update) = update {
+                            buffer.push(update);
+                            if buffer.len() >= 1024 {
+                                apply_learning_batch(&mut buffer);
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        if !buffer.is_empty() {
+                            apply_learning_batch(&mut buffer);
+                        }
+                    }
+                }
+            }
+            if !buffer.is_empty() {
+                apply_learning_batch(&mut buffer);
+            }
+        });
+        return Some(tx);
+    }
+
+    LEARNING_TX.get().cloned()
+}
+
+fn apply_learning_batch(buffer: &mut Vec<LearningUpdate>) {
+    for update in buffer.drain(..) {
+        match update {
+            LearningUpdate::Global { domain, upstream, latency_ms } => {
+                apply_domain_result_clean(&domain, &upstream, latency_ms);
+            }
+            LearningUpdate::Client { key, domain, upstream, latency_ms } => {
+                apply_client_result_clean(&key, &domain, &upstream, latency_ms);
+            }
+        }
+    }
+}
+
+fn apply_domain_result_clean(domain: &str, upstream: &str, latency_ms: u64) {
+    if let Some(mut entry) = DOMAIN_MEMORY.get_mut(domain) {
         entry.update(upstream.to_string(), latency_ms);
     } else {
-        DOMAIN_MEMORY.insert(domain_lower, DomainMemory::new(upstream.to_string(), latency_ms));
+        DOMAIN_MEMORY.insert(domain.to_string(), DomainMemory::new(upstream.to_string(), latency_ms));
     }
-    
+
     // 定期清理过期条目（每添加100条时检查）
     if DOMAIN_MEMORY.len() % 100 == 0 {
+        update_domain_memory_params();
         cleanup_expired_domains();
     }
 }
 
+fn apply_client_result_clean(key: &str, domain: &str, upstream: &str, latency_ms: u64) {
+    CLIENT_DOMAIN_MEMORY.entry(key.to_string())
+        .and_modify(|entry| {
+            entry.update(upstream.to_string(), latency_ms);
+        })
+        .or_insert(DomainMemory::new(upstream.to_string(), latency_ms));
+
+    if CLIENT_DOMAIN_MEMORY.len() % 100 == 0 {
+        cleanup_client_memory();
+    }
+
+    apply_domain_result_clean(domain, upstream, latency_ms);
+}
+
+/// 记录域名查询结果（AI 学习）
+pub fn record_domain_result(domain: &str, upstream: &str, latency_ms: u64) {
+    let domain = normalize_domain_lower(domain);
+    record_domain_result_lower(domain.as_ref(), upstream, latency_ms);
+}
+
+pub fn record_domain_result_lower(domain_lower: &str, upstream: &str, latency_ms: u64) {
+    // 只记录快速响应（阈值内），避免记录慢速查询
+    if latency_ms > DOMAIN_MEMORY_MAX_LATENCY_MS {
+        return;
+    }
+
+    let domain_clean = domain_lower.trim_end_matches('.');
+
+    if let Some(tx) = get_learning_tx() {
+        if tx.try_send(LearningUpdate::Global {
+            domain: domain_clean.to_string(),
+            upstream: upstream.to_string(),
+            latency_ms,
+        }).is_ok() {
+            return;
+        }
+    }
+
+    apply_domain_result_clean(domain_clean, upstream, latency_ms);
+}
+
 /// 获取域名的历史最优上游（AI 推荐）
 pub fn get_domain_best_upstream(domain: &str) -> Option<String> {
-    let domain_lower = domain.to_lowercase();
-    
-    if let Some(entry) = DOMAIN_MEMORY.get(&domain_lower) {
+    let domain = normalize_domain_lower(domain);
+    get_domain_best_upstream_lower(domain.as_ref())
+}
+
+pub fn get_domain_best_upstream_lower(domain_lower: &str) -> Option<String> {
+    let domain_lower = domain_lower.trim_end_matches('.');
+
+    if let Some(entry) = DOMAIN_MEMORY.get(domain_lower) {
         // 检查是否过期
         if entry.is_expired() {
             drop(entry);  // 释放读锁
-            DOMAIN_MEMORY.remove(&domain_lower);
+            DOMAIN_MEMORY.remove(domain_lower);
             return None;
         }
-        
+
         // 只在足够可信时返回推荐
         if entry.is_confident() {
             debug!("💡 AI推荐: {} → {} ({}ms, 成功{}次)", 
-                   domain, entry.best_upstream, entry.avg_latency, entry.success_count);
+                   domain_lower, entry.best_upstream, entry.avg_latency, entry.success_count);
             return Some(entry.best_upstream.clone());
         }
     }
-    
+
     None
 }
 
@@ -1803,8 +2037,9 @@ fn cleanup_expired_domains() {
     DOMAIN_MEMORY.retain(|_, v| !v.is_expired());
     
     // 2. 如果仍超出容量限制，淘汰剩余TTL最短的
-    if DOMAIN_MEMORY.len() > MAX_DOMAIN_MEMORY {
-        let excess = DOMAIN_MEMORY.len() - MAX_DOMAIN_MEMORY;
+    let capacity = DOMAIN_MEMORY_CAPACITY.load(Ordering::Relaxed);
+    if DOMAIN_MEMORY.len() > capacity {
+        let excess = DOMAIN_MEMORY.len() - capacity;
         
         // 收集所有条目并按剩余TTL排序
         let mut entries: Vec<_> = DOMAIN_MEMORY.iter()
@@ -1863,49 +2098,64 @@ pub fn get_client_subnet(ip: std::net::IpAddr) -> String {
 
 /// 生成客户端感知的记忆 Key
 fn client_memory_key(domain: &str, client_ip: std::net::IpAddr) -> String {
-    format!("{}@{}", domain.to_lowercase(), get_client_subnet(client_ip))
+    let domain = normalize_domain_lower(domain);
+    client_memory_key_lower(domain.as_ref(), client_ip)
+}
+
+fn client_memory_key_lower(domain_lower: &str, client_ip: std::net::IpAddr) -> String {
+    format!("{}@{}", domain_lower.trim_end_matches('.'), get_client_subnet(client_ip))
 }
 
 /// 记录域名查询结果（客户端感知版）
 pub fn record_domain_result_for_client(domain: &str, upstream: &str, latency_ms: u64, client_ip: std::net::IpAddr) {
+    let domain = normalize_domain_lower(domain);
+    record_domain_result_for_client_lower(domain.as_ref(), upstream, latency_ms, client_ip);
+}
+
+pub fn record_domain_result_for_client_lower(domain_lower: &str, upstream: &str, latency_ms: u64, client_ip: std::net::IpAddr) {
     // 只记录快速响应（阈值内）
     if latency_ms > CLIENT_MEMORY_MAX_LATENCY_MS {
         return;
     }
-    
-    let key = client_memory_key(domain, client_ip);
-    
-    CLIENT_DOMAIN_MEMORY.entry(key.clone())
-        .and_modify(|entry| {
-            entry.update(upstream.to_string(), latency_ms);
-        })
-        .or_insert(DomainMemory::new(upstream.to_string(), latency_ms));
-    
-    // 定期清理
-    if CLIENT_DOMAIN_MEMORY.len() % 100 == 0 {
-        cleanup_client_memory();
+
+    let domain_clean = domain_lower.trim_end_matches('.');
+    let key = client_memory_key_lower(domain_clean, client_ip);
+
+    if let Some(tx) = get_learning_tx() {
+        if tx.try_send(LearningUpdate::Client {
+            key: key.clone(),
+            domain: domain_clean.to_string(),
+            upstream: upstream.to_string(),
+            latency_ms,
+        }).is_ok() {
+            return;
+        }
     }
-    
-    // 同时更新全局记忆（向后兼容）
-    record_domain_result(domain, upstream, latency_ms);
+
+    apply_client_result_clean(&key, domain_clean, upstream, latency_ms);
 }
 
 /// 获取域名的历史最优上游（客户端感知版）
 pub fn get_domain_best_upstream_for_client(domain: &str, client_ip: std::net::IpAddr) -> Option<String> {
-    let key = client_memory_key(domain, client_ip);
-    
+    let domain = normalize_domain_lower(domain);
+    get_domain_best_upstream_for_client_lower(domain.as_ref(), client_ip)
+}
+
+pub fn get_domain_best_upstream_for_client_lower(domain_lower: &str, client_ip: std::net::IpAddr) -> Option<String> {
+    let key = client_memory_key_lower(domain_lower, client_ip);
+
     // 优先查找客户端特定记忆
     if let Some(entry) = CLIENT_DOMAIN_MEMORY.get(&key) {
         if !entry.is_expired() && entry.is_confident() {
             let subnet = get_client_subnet(client_ip);
             debug!("💡 AI推荐(客户端感知): {}@{} → {} ({}ms, 成功{}次)", 
-                   domain, subnet, entry.best_upstream, entry.avg_latency, entry.success_count);
+                   domain_lower.trim_end_matches('.'), subnet, entry.best_upstream, entry.avg_latency, entry.success_count);
             return Some(entry.best_upstream.clone());
         }
     }
-    
+
     // 回退到全局记忆
-    get_domain_best_upstream(domain)
+    get_domain_best_upstream_lower(domain_lower)
 }
 
 /// 清理客户端记忆
@@ -1943,28 +2193,35 @@ static LAST_QUERY: Lazy<RwLock<Option<(String, Instant)>>> = Lazy::new(|| RwLock
 
 /// 记录查询序列（用于学习关联规则）
 pub fn record_query_sequence(domain: &str) {
-    let domain_lower = domain.to_lowercase();
+    let domain = normalize_domain_lower(domain);
+    record_query_sequence_lower(domain.as_ref());
+}
+
+pub fn record_query_sequence_lower(domain_lower: &str) {
+    let domain_lower = domain_lower.trim_end_matches('.');
     let now = Instant::now();
-    
+
     // 获取上一次查询
     let last = {
         let guard = LAST_QUERY.read();
         guard.clone()
     };
-    
+
+    let domain_lower_owned = domain_lower.to_string();
+
     // 如果上一次查询在5秒内，记录关联
     if let Some((prev_domain, prev_time)) = last {
         if now.duration_since(prev_time) < Duration::from_secs(5) && prev_domain != domain_lower {
             // 记录: prev_domain -> domain_lower
             let follows = DOMAIN_FOLLOWS.entry(prev_domain).or_insert_with(DashMap::new);
-            let mut count = follows.entry(domain_lower.clone()).or_insert(0);
+            let mut count = follows.entry(domain_lower_owned.clone()).or_insert(0);
             *count.value_mut() += 1;
         }
     }
-    
+
     // 更新最近查询
-    *LAST_QUERY.write() = Some((domain_lower, now));
-    
+    *LAST_QUERY.write() = Some((domain_lower_owned, now));
+
     // 定期清理（每1000次）
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     if COUNTER.fetch_add(1, Ordering::Relaxed) % 1000 == 0 {
@@ -1974,17 +2231,22 @@ pub fn record_query_sequence(domain: &str) {
 
 /// 获取预测的下一个查询（用于预热）
 pub fn predict_next_queries(domain: &str, top_n: usize) -> Vec<String> {
-    let domain_lower = domain.to_lowercase();
-    
-    if let Some(follows) = DOMAIN_FOLLOWS.get(&domain_lower) {
+    let domain = normalize_domain_lower(domain);
+    predict_next_queries_lower(domain.as_ref(), top_n)
+}
+
+pub fn predict_next_queries_lower(domain_lower: &str, top_n: usize) -> Vec<String> {
+    let domain_lower = domain_lower.trim_end_matches('.');
+
+    if let Some(follows) = DOMAIN_FOLLOWS.get(domain_lower) {
         let mut predictions: Vec<(String, u32)> = follows
             .iter()
             .map(|e| (e.key().clone(), *e.value()))
             .collect();
-        
+
         // 按频率排序
         predictions.sort_by(|a, b| b.1.cmp(&a.1));
-        
+
         // 只返回高频关联（至少3次）
         predictions.into_iter()
             .filter(|(_, count)| *count >= 3)
@@ -2250,7 +2512,12 @@ pub fn should_prefetch_for_peak() -> bool {
 
 /// 记录域名查询（复用已有的 track_domain）
 pub fn record_domain_query(domain: &str) {
-    track_domain(domain);
+    let domain = normalize_domain_lower(domain);
+    record_domain_query_lower(domain.as_ref());
+}
+
+pub fn record_domain_query_lower(domain_lower: &str) {
+    track_domain(domain_lower);
 }
 
 // ============== Level 8: 上游评级展示 ==============
@@ -2540,49 +2807,54 @@ fn calculate_entropy(s: &str) -> f64 {
 
 /// 检查是否为 DGA 恶意域名
 pub fn detect_dga_domain(domain: &str) -> DgaResult {
+    let domain = normalize_domain_lower(domain);
+    detect_dga_domain_lower(domain.as_ref())
+}
+
+pub fn detect_dga_domain_lower(domain_lower: &str) -> DgaResult {
     // 忽略顶级域 (TLD)
-    let clean = domain.trim_end_matches('.');
+    let clean = domain_lower.trim_end_matches('.');
     let mut iter = clean.rsplit('.');
     let _tld = iter.next();
     let sld = match iter.next() {
         Some(s) if !s.is_empty() => s,
         _ => return DgaResult { is_dga: false, score: 0.0, reason: "short" },
     };
-    
+
     // 1. 长度检查: 太短通常不是 DGA
     if sld.len() < 6 {
         return DgaResult { is_dga: false, score: 0.0, reason: "short_sld" };
     }
-    
+
     // 2. 熵值检查
     let entropy = calculate_entropy(sld);
-    
+
     // 3. 数字比例
     let digit_count = sld.chars().filter(|c| c.is_digit(10)).count();
     let digit_ratio = digit_count as f64 / sld.len() as f64;
-    
+
     // 4. 辅音比例 (Consonant Ratio)
     let vowels = "aeiou";
     let consonant_count = sld.chars()
         .filter(|c| c.is_alphabetic() && !vowels.contains(*c))
         .count();
     let consonant_ratio = consonant_count as f64 / sld.len() as f64;
-    
+
     // 综合判定
     // 熵值 > 3.8 且长度 > 10 -> 高风险
     // 辅音比例 > 0.8 (如 "gxkqz") -> 高风险
     if entropy > 4.2 {
         return DgaResult { is_dga: true, score: entropy, reason: "high_entropy" };
     }
-    
+
     if consonant_ratio > 0.85 {
         return DgaResult { is_dga: true, score: consonant_ratio, reason: "high_consonant" };
     }
-    
+
     if sld.len() > 12 && entropy > 3.8 && digit_ratio > 0.3 {
         return DgaResult { is_dga: true, score: entropy, reason: "mixed_high_entropy" };
     }
-    
+
     DgaResult { is_dga: false, score: entropy, reason: "normal" }
 }
 
@@ -2889,13 +3161,18 @@ const MAX_TIME_PATTERNS: usize = 50000;
 
 /// 记录带时间的域名访问 (用于学习时间模式)
 pub fn record_timed_access(domain: &str) {
+    let domain = normalize_domain_lower(domain);
+    record_timed_access_lower(domain.as_ref());
+}
+
+pub fn record_timed_access_lower(domain_lower: &str) {
     let hour = chrono::Local::now().hour() as u8;
-    let key = (domain.to_lowercase(), hour);
-    
+    let key = (domain_lower.to_string(), hour);
+
     TIME_PATTERN_ACCESS.entry(key)
         .and_modify(|count| *count = count.saturating_add(1))
         .or_insert(1);
-    
+
     // 定期清理
     if TIME_PATTERN_ACCESS.len() > MAX_TIME_PATTERNS {
         cleanup_time_patterns();

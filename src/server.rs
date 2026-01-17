@@ -653,6 +653,12 @@ impl DnsServer {
         info!("👂 TCP Server starting on {}", self.addr);
         let listener = TcpListener::bind(&self.addr).await?;
 
+        let read_timeout = match self.socket_opts.tcp_read_timeout_ms {
+            Some(0) => return Err(anyhow::anyhow!("tcp_read_timeout_ms must be > 0")),
+            Some(v) => Some(std::time::Duration::from_millis(v)),
+            None => None,
+        };
+
         loop {
             let (mut socket, src) = match listener.accept().await {
                 Ok(s) => s,
@@ -671,8 +677,21 @@ impl DnsServer {
 
                 // Read 2-byte length
                 let mut len_buf = [0u8; 2];
-                if let Err(_) = socket.read_exact(&mut len_buf).await {
-                     return;
+                let len_read = if let Some(timeout) = read_timeout {
+                    match tokio::time::timeout(timeout, socket.read_exact(&mut len_buf)).await {
+                        Ok(Ok(_)) => Ok(()),
+                        Ok(Err(e)) => Err(anyhow::anyhow!(e)),
+                        Err(e) => Err(anyhow::anyhow!(e)),
+                    }
+                } else {
+                    socket
+                        .read_exact(&mut len_buf)
+                        .await
+                        .map(|_| ())
+                        .map_err(anyhow::Error::new)
+                };
+                if len_read.is_err() {
+                    return;
                 }
                 let len = u16::from_be_bytes(len_buf) as usize;
                 
@@ -681,7 +700,20 @@ impl DnsServer {
 
                 // Read body
                 let mut buf = vec![0u8; len];
-                if let Err(e) = socket.read_exact(&mut buf).await {
+                let body_read = if let Some(timeout) = read_timeout {
+                    match tokio::time::timeout(timeout, socket.read_exact(&mut buf)).await {
+                        Ok(Ok(_)) => Ok(()),
+                        Ok(Err(e)) => Err(anyhow::anyhow!(e)),
+                        Err(e) => Err(anyhow::anyhow!(e)),
+                    }
+                } else {
+                    socket
+                        .read_exact(&mut buf)
+                        .await
+                        .map(|_| ())
+                        .map_err(anyhow::Error::new)
+                };
+                if let Err(e) = body_read {
                     debug!("Failed to read TCP body: {}", e);
                     return;
                 }
@@ -712,6 +744,12 @@ impl DnsServer {
         info!("👂 DoT Server (DNS over TLS) starting on {}", self.addr);
         let listener = TcpListener::bind(&self.addr).await?;
 
+        let read_timeout = match self.socket_opts.tcp_read_timeout_ms {
+            Some(0) => return Err(anyhow::anyhow!("tcp_read_timeout_ms must be > 0")),
+            Some(v) => std::time::Duration::from_millis(v),
+            None => std::time::Duration::from_secs(5),
+        };
+
         loop {
             let (stream, src) = match listener.accept().await {
                 Ok(s) => s,
@@ -738,8 +776,13 @@ impl DnsServer {
                 // 2. Read DNS Message (RFC 7858: 2-byte length prefix)
                 loop {
                     let mut len_buf = [0u8; 2];
-                    // Read length with timeout (5s)
-                    if let Err(_) = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_exact(&mut len_buf)).await {
+                    // Read length with timeout
+                    let len_read = match tokio::time::timeout(read_timeout, stream.read_exact(&mut len_buf)).await {
+                        Ok(Ok(_)) => Ok(()),
+                        Ok(Err(e)) => Err(anyhow::anyhow!(e)),
+                        Err(e) => Err(anyhow::anyhow!(e)),
+                    };
+                    if len_read.is_err() {
                         return; // Timeout or Error
                     }
                     let len = u16::from_be_bytes(len_buf) as usize;
@@ -747,8 +790,13 @@ impl DnsServer {
                     if len > 65535 { return; }
 
                     let mut buf = vec![0u8; len];
-                    if let Err(_) = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_exact(&mut buf)).await {
-                         debug!("DoT read body timeout");
+                    let body_read = match tokio::time::timeout(read_timeout, stream.read_exact(&mut buf)).await {
+                        Ok(Ok(_)) => Ok(()),
+                        Ok(Err(e)) => Err(anyhow::anyhow!(e)),
+                        Err(e) => Err(anyhow::anyhow!(e)),
+                    };
+                    if let Err(e) = body_read {
+                         debug!("DoT read body timeout: {}", e);
                          return;
                     }
 
@@ -941,6 +989,17 @@ impl DnsServer {
 
         let listener = tokio::net::TcpListener::bind(&self.addr).await?;
 
+        let doh_keep_alive_interval = match self.socket_opts.doh_keep_alive_interval_ms {
+            Some(0) => return Err(anyhow::anyhow!("doh_keep_alive_interval_ms must be > 0")),
+            Some(v) => Some(std::time::Duration::from_millis(v)),
+            None => None,
+        };
+        let doh_keep_alive_timeout = match self.socket_opts.doh_keep_alive_timeout_ms {
+            Some(0) => return Err(anyhow::anyhow!("doh_keep_alive_timeout_ms must be > 0")),
+            Some(v) => Some(std::time::Duration::from_millis(v)),
+            None => None,
+        };
+
         if let Some(tls_conf) = &self.tls_config {
             let tls = crate::server::tls_loader::build_doh_config(&tls_conf.cert, &tls_conf.key)?;
             let acceptor = TlsAcceptor::from(tls);
@@ -964,7 +1023,15 @@ impl DnsServer {
                     let hyper_svc = TowerToHyperService::new(svc);
                     let io = TokioIo::new(tls_stream);
 
-                    if let Err(e) = AutoBuilder::new(TokioExecutor::new())
+                    let mut builder = AutoBuilder::new(TokioExecutor::new());
+                    if let Some(v) = doh_keep_alive_interval {
+                        builder.http2().keep_alive_interval(v);
+                    }
+                    if let Some(v) = doh_keep_alive_timeout {
+                        builder.http2().keep_alive_timeout(v);
+                    }
+
+                    if let Err(e) = builder
                         .serve_connection_with_upgrades(io, hyper_svc)
                         .await
                     {

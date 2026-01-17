@@ -8,7 +8,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::Duration;
-use radix_trie::{Trie, TrieCommon};
+use std::collections::HashMap;
+use std::sync::Arc;
 use moka::sync::Cache;
 use tracing::{debug, info, warn};
 
@@ -19,26 +20,48 @@ use crate::core::plugin::Plugin;
 #[derive(Debug)]
 pub struct MatcherPlugin {
     pub name: String,
-    domains: HashSet<String>,     // Exact domain matches
-    suffix_trie: Trie<String, ()>, // Suffix matches (reversed domain trie)
+    domains: HashSet<Arc<str>>,     // Exact domain matches (interned)
+    suffix_root: SuffixNode,         // Suffix matches (label trie)
+    keywords: HashSet<Arc<str>>,     // Keyword contains matches (interned)
     mark: Option<String>,
     cache: Cache<String, bool>,
     total_rules: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+struct SuffixNode {
+    children: HashMap<Arc<str>, SuffixNode>,
+    is_match: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleKind {
+    Exact,
+    Suffix,
+    Keyword,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedRule {
+    kind: RuleKind,
+    value: String,
 }
 
 impl MatcherPlugin {
     /// Create a new MatcherPlugin from a list of rule files
     pub fn new(name: String, files: Vec<String>, mark: Option<String>) -> Self {
         let mut domains = HashSet::new();
-        let mut suffix_trie = Trie::new();
+        let mut suffix_root = SuffixNode::default();
+        let mut keywords = HashSet::new();
         let mut total_rules = 0;
+        let mut interner: HashSet<Arc<str>> = HashSet::new();
         let cache = Cache::builder()
             .max_capacity(100_000)
             .time_to_live(Duration::from_secs(3600))
             .build();
 
         for file_path in &files {
-            match Self::load_file(file_path, &mut domains, &mut suffix_trie) {
+            match Self::load_file(file_path, &mut domains, &mut suffix_root, &mut keywords, &mut interner) {
                 Ok(count) => {
                     total_rules += count;
                     info!("📂 Matcher '{}': Loaded {} rules from {}", name, count, file_path);
@@ -54,7 +77,8 @@ impl MatcherPlugin {
         Self {
             name,
             domains,
-            suffix_trie,
+            suffix_root,
+            keywords,
             mark,
             total_rules,
             cache,
@@ -64,8 +88,10 @@ impl MatcherPlugin {
     /// Load rules from a single file
     fn load_file(
         path: &str,
-        domains: &mut HashSet<String>,
-        suffix_trie: &mut Trie<String, ()>,
+        domains: &mut HashSet<Arc<str>>,
+        suffix_root: &mut SuffixNode,
+        keywords: &mut HashSet<Arc<str>>,
+        interner: &mut HashSet<Arc<str>>,
     ) -> Result<usize> {
         let path = Path::new(path);
         if !path.exists() {
@@ -86,23 +112,37 @@ impl MatcherPlugin {
             }
 
             // Parse different rule formats
-            let domain = Self::parse_rule(line);
-            if let Some(d) = domain {
-                if d.starts_with('.') {
-                    // Suffix match (e.g., ".example.com" matches "sub.example.com")
-                    // Store reversed suffix (keeps leading dot for boundary safety)
-                    let rev = Self::reverse_domain(&d);
-                    suffix_trie.insert(rev, ());
+            let rule = Self::parse_rule(line);
+            if let Some(rule) = rule {
+                match rule.kind {
+                    RuleKind::Suffix => {
+                        // Suffix match (e.g., "example.com" matches "sub.example.com")
+                        // Store as label trie: "www.example.com" -> com -> example
+                        let clean = rule.value.trim_start_matches('.').trim_end_matches('.');
+                        if !clean.is_empty() {
+                            let mut node = &mut *suffix_root;
+                            for part in clean.rsplit('.') {
+                                if part.is_empty() {
+                                    continue;
+                                }
+                                let key = Self::intern_label(interner, part);
+                                node = node.children.entry(key).or_default();
+                            }
+                            node.is_match = true;
 
-                    // Also allow exact match on base domain ("example.com")
-                    if let Some(base) = d.strip_prefix('.') {
-                        if !base.is_empty() {
-                            domains.insert(base.to_string());
+                            // Also allow exact match on base domain ("example.com")
+                            let key = Self::intern_label(interner, clean);
+                            domains.insert(key);
                         }
                     }
-                } else {
-                    // Exact match
-                    domains.insert(d);
+                    RuleKind::Exact => {
+                        let key = Self::intern_label(interner, &rule.value);
+                        domains.insert(key);
+                    }
+                    RuleKind::Keyword => {
+                        let key = Self::intern_label(interner, &rule.value);
+                        keywords.insert(key);
+                    }
                 }
                 count += 1;
             }
@@ -111,44 +151,64 @@ impl MatcherPlugin {
         Ok(count)
     }
 
-    /// Parse a single rule line into a domain
-    fn parse_rule(line: &str) -> Option<String> {
+    fn intern_label(interner: &mut HashSet<Arc<str>>, label: &str) -> Arc<str> {
+        if let Some(existing) = interner.get(label) {
+            return existing.clone();
+        }
+        let arc: Arc<str> = Arc::from(label);
+        interner.insert(arc.clone());
+        arc
+    }
+
+    /// Parse a single rule line into a parsed rule
+    fn parse_rule(line: &str) -> Option<ParsedRule> {
         let line = line.to_lowercase();
 
         // Handle different formats:
         // 1. Plain domain: example.com
         // 2. With prefix: domain:example.com
-        // 3. With suffix: full:example.com
-        // 4. Keyword: keyword:xxx (skip for now)
-        // 5. Regex: regexp:xxx (skip for now)
+        // 3. With suffix: suffix:example.com
+        // 4. Keyword: keyword:xxx
+        // 5. Regex: regexp:xxx (skip)
 
-        if line.starts_with("keyword:") || line.starts_with("regexp:") {
-            // Skip keyword and regex rules for now
+        if line.starts_with("regexp:") {
             return None;
         }
 
-        let domain = if line.starts_with("domain:") {
-            line.strip_prefix("domain:")?.to_string()
+        let (mut kind, mut value) = if line.starts_with("keyword:") {
+            (RuleKind::Keyword, line.strip_prefix("keyword:")?.to_string())
+        } else if line.starts_with("domain:") {
+            (RuleKind::Exact, line.strip_prefix("domain:")?.to_string())
         } else if line.starts_with("full:") {
-            line.strip_prefix("full:")?.to_string()
+            (RuleKind::Exact, line.strip_prefix("full:")?.to_string())
         } else if line.starts_with("suffix:") {
-            format!(".{}", line.strip_prefix("suffix:")?)
+            (RuleKind::Suffix, line.strip_prefix("suffix:")?.to_string())
         } else if line.contains(':') {
             // Unknown prefix, skip
             return None;
         } else {
             // Plain domain
-            line.to_string()
+            (RuleKind::Exact, line.to_string())
         };
 
-        // Clean up trailing dot
-        let domain = domain.trim_end_matches('.').to_string();
-
-        if domain.is_empty() {
+        value = value.trim().trim_end_matches('.').to_string();
+        if value.is_empty() {
             return None;
         }
 
-        Some(domain)
+        if kind != RuleKind::Keyword && value.starts_with('.') {
+            kind = RuleKind::Suffix;
+            value = value.trim_start_matches('.').to_string();
+        }
+
+        if kind == RuleKind::Suffix {
+            value = value.trim_start_matches('.').to_string();
+            if value.is_empty() {
+                return None;
+            }
+        }
+
+        Some(ParsedRule { kind, value })
     }
 
     /// Normalize domain for matching (trim trailing dot, lower-case if needed)
@@ -162,52 +222,105 @@ impl MatcherPlugin {
         }
     }
 
-    /// Reverse a domain for suffix trie matching
-    fn reverse_domain(domain: &str) -> String {
-        let mut rev = String::with_capacity(domain.len());
-        for b in domain.as_bytes().iter().rev() {
-            rev.push(*b as char);
+    #[inline]
+    fn clean_domain<'a>(domain_lower: &'a str) -> &'a str {
+        if domain_lower.as_bytes().last() == Some(&b'.') {
+            &domain_lower[..domain_lower.len() - 1]
+        } else {
+            domain_lower
         }
-        rev
     }
 
     /// Check if a domain matches any rule
     pub fn matches(&self, domain: &str) -> bool {
         let domain = Self::normalize_domain(domain);
         let domain_ref = domain.as_ref();
+        self.matches_lower(domain_ref)
+    }
 
-        if let Some(cached) = self.cache.get(domain_ref) {
+    fn matches_lower(&self, domain_lower: &str) -> bool {
+        let domain_clean = Self::clean_domain(domain_lower);
+
+        if let Some(cached) = self.cache.get(domain_clean) {
             return cached;
         }
 
         // Exact match
-        if self.domains.contains(domain_ref) {
-            let key = match domain {
-                Cow::Borrowed(d) => d.to_string(),
-                Cow::Owned(s) => s,
-            };
-            self.cache.insert(key, true);
+        if self.domains.contains(domain_clean) {
+            self.cache.insert(domain_clean.to_string(), true);
             return true;
         }
 
-        // Suffix match via radix trie (reversed domain prefix)
-        if !self.suffix_trie.is_empty() {
-            let rev = Self::reverse_domain(domain_ref);
-            if self.suffix_trie.get_ancestor_value(&rev).is_some() {
-                let key = match domain {
-                    Cow::Borrowed(d) => d.to_string(),
-                    Cow::Owned(s) => s,
-                };
-                self.cache.insert(key, true);
-                return true;
+        // Suffix match via label trie
+        let mut node = &self.suffix_root;
+        for part in domain_clean.rsplit('.') {
+            if let Some(child) = node.children.get(part) {
+                node = child;
+                if node.is_match {
+                    self.cache.insert(domain_clean.to_string(), true);
+                    return true;
+                }
+            } else {
+                break;
             }
         }
 
-        let key = match domain {
-            Cow::Borrowed(d) => d.to_string(),
-            Cow::Owned(s) => s,
-        };
-        self.cache.insert(key, false);
+        // Keyword contains match
+        if !self.keywords.is_empty() {
+            for keyword in &self.keywords {
+                if domain_clean.contains(keyword.as_ref()) {
+                    self.cache.insert(domain_clean.to_string(), true);
+                    return true;
+                }
+            }
+        }
+
+        self.cache.insert(domain_clean.to_string(), false);
+        false
+    }
+
+    fn matches_lower_with_parts(&self, domain_lower: &str, ranges: &[(usize, usize)]) -> bool {
+        let domain_clean = Self::clean_domain(domain_lower);
+
+        if let Some(cached) = self.cache.get(domain_clean) {
+            return cached;
+        }
+
+        // Exact match
+        if self.domains.contains(domain_clean) {
+            self.cache.insert(domain_clean.to_string(), true);
+            return true;
+        }
+
+        // Suffix match via label trie using precomputed ranges
+        let mut node = &self.suffix_root;
+        for (start, end) in ranges.iter().rev() {
+            if *end > domain_clean.len() {
+                continue;
+            }
+            let part = &domain_clean[*start..*end];
+            if let Some(child) = node.children.get(part) {
+                node = child;
+                if node.is_match {
+                    self.cache.insert(domain_clean.to_string(), true);
+                    return true;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Keyword contains match
+        if !self.keywords.is_empty() {
+            for keyword in &self.keywords {
+                if domain_clean.contains(keyword.as_ref()) {
+                    self.cache.insert(domain_clean.to_string(), true);
+                    return true;
+                }
+            }
+        }
+
+        self.cache.insert(domain_clean.to_string(), false);
         false
     }
 
@@ -228,10 +341,12 @@ impl Plugin for MatcherPlugin {
         }
 
         let domain = ctx.qname_ref();
+        let domain_lower = ctx.qname_lower_ref();
+        let ranges = ctx.qname_parts_ranges();
 
-        if self.matches(domain) {
+        if self.matches_lower_with_parts(domain_lower, ranges) {
             debug!("✅ Matcher '{}' matched: {}", self.name, domain);
-            
+
             // Add tag if configured
             if let Some(ref mark) = self.mark {
                 ctx.add_tag(mark);
@@ -247,7 +362,8 @@ impl Clone for MatcherPlugin {
         Self {
             name: self.name.clone(),
             domains: self.domains.clone(),
-            suffix_trie: self.suffix_trie.clone(),
+            suffix_root: self.suffix_root.clone(),
+            keywords: self.keywords.clone(),
             mark: self.mark.clone(),
             total_rules: self.total_rules,
             cache: self.cache.clone(),
@@ -261,11 +377,30 @@ mod tests {
 
     #[test]
     fn test_parse_rule() {
-        assert_eq!(MatcherPlugin::parse_rule("example.com"), Some("example.com".to_string()));
-        assert_eq!(MatcherPlugin::parse_rule("domain:example.com"), Some("example.com".to_string()));
-        assert_eq!(MatcherPlugin::parse_rule("full:example.com"), Some("example.com".to_string()));
-        assert_eq!(MatcherPlugin::parse_rule("suffix:example.com"), Some(".example.com".to_string()));
-        assert_eq!(MatcherPlugin::parse_rule("keyword:xxx"), None);
+        assert_eq!(
+            MatcherPlugin::parse_rule("example.com"),
+            Some(ParsedRule { kind: RuleKind::Exact, value: "example.com".to_string() })
+        );
+        assert_eq!(
+            MatcherPlugin::parse_rule("domain:example.com"),
+            Some(ParsedRule { kind: RuleKind::Exact, value: "example.com".to_string() })
+        );
+        assert_eq!(
+            MatcherPlugin::parse_rule("full:example.com"),
+            Some(ParsedRule { kind: RuleKind::Exact, value: "example.com".to_string() })
+        );
+        assert_eq!(
+            MatcherPlugin::parse_rule("suffix:example.com"),
+            Some(ParsedRule { kind: RuleKind::Suffix, value: "example.com".to_string() })
+        );
+        assert_eq!(
+            MatcherPlugin::parse_rule(".example.com"),
+            Some(ParsedRule { kind: RuleKind::Suffix, value: "example.com".to_string() })
+        );
+        assert_eq!(
+            MatcherPlugin::parse_rule("keyword:xxx"),
+            Some(ParsedRule { kind: RuleKind::Keyword, value: "xxx".to_string() })
+        );
         assert_eq!(MatcherPlugin::parse_rule("regexp:xxx"), None);
     }
 }

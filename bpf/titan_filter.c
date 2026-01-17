@@ -79,7 +79,7 @@ static __always_inline __u64 parse_dns_qname_hash(void *dns_payload, void *data_
     
     // Limit loop to prevent BPF verifier rejection
     #pragma unroll
-    for (int i = 0; i < 64; i++) { 
+    for (int i = 0; i < 128; i++) { 
         if ((void *)(ptr + 1) > data_end) return 0;
         
         __u8 byte = *ptr;
@@ -253,6 +253,9 @@ int titan_dns_filter(struct xdp_md *ctx) {
         }
 
         // Cache Hit!
+        // Only serve NOERROR from XDP cache to avoid negative/ambiguous caching.
+        if (cache_entry->rcode != 0)
+            return XDP_PASS;
         // Check if TTL is low -> trigger Shadow Refresh
         __u64 remaining_ns = cache_entry->expire_ns - now;
         if (remaining_ns < REFRESH_THRESHOLD_NS && remaining_ns > 0) {
@@ -285,7 +288,11 @@ int titan_dns_filter(struct xdp_md *ctx) {
         // 2. Prepare Response
         // We need to modify packet in-place.
         
-        __u32 new_len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + cache_entry->len;
+        __u32 effective_len = cache_entry->len;
+        // Skip oversized or empty cached responses to avoid truncation/mis-hit.
+        if (effective_len == 0 || effective_len > MAX_DNS_RESPONSE_LEN)
+            return XDP_PASS;
+        __u32 new_len = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + effective_len;
         
         // Resize packet (Adjust tail)
         int delta = new_len - (data_end - data);
@@ -309,9 +316,7 @@ int titan_dns_filter(struct xdp_md *ctx) {
         // 3. Copy cached response body
         // SAFETY: We must use a constant loop bound and perform boundary checks strictly.
         __u8 *resp_ptr = cache_entry->response;
-        __u32 len = cache_entry->len;
-        
-        if (len > MAX_DNS_RESPONSE_LEN) len = MAX_DNS_RESPONSE_LEN;
+        __u32 len = effective_len;
 
         // Copy in 32-byte chunks to reduce loop iterations/instruction count
         #pragma unroll
@@ -348,12 +353,12 @@ int titan_dns_filter(struct xdp_md *ctx) {
         swap_udp(udp);
         
         // Fix IP Length
-        ip->tot_len = bpf_htons(sizeof(struct iphdr) + sizeof(struct udphdr) + cache_entry->len);
+        ip->tot_len = bpf_htons(sizeof(struct iphdr) + sizeof(struct udphdr) + effective_len);
         ip->check = 0;
         ip->check = calc_ip_csum(ip);
 
         // Fix UDP Length
-        udp->len = bpf_htons(sizeof(struct udphdr) + cache_entry->len);
+        udp->len = bpf_htons(sizeof(struct udphdr) + effective_len);
         
         // Restore Transaction ID (payload pointer was moved, recalculate)
         void *dns_start = (void *)(udp + 1);

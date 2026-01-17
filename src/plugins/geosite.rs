@@ -4,19 +4,19 @@
 //! All rules are treated as Suffix/RootDomain rules to ensure maximum coverage (e.g. qq.com matches www.qq.com).
 
 use anyhow::Result;
+use moka::sync::Cache;
+use parking_lot::RwLock;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use parking_lot::RwLock;
 use tracing::{info, warn};
-use moka::sync::Cache;
 
 use crate::core::context::Context;
+use crate::core::geosite_proto::{domain, GeoSiteList};
 use crate::core::plugin::Plugin;
-use crate::core::geosite_proto::{GeoSiteList, domain};
 use prost::Message;
 
 /// Trie Node
@@ -54,16 +54,20 @@ impl DomainSet {
 
     /// Add domain to Trie (treated as Suffix)
     fn add_domain(&mut self, domain: String) {
-        if domain.is_empty() { return; }
-        
+        if domain.is_empty() {
+            return;
+        }
+
         let domain_lower = domain.to_lowercase();
         // Remove trailing dot if any
         let domain_clean = domain_lower.trim_end_matches('.');
-        
+
         let mut node = &mut self.root;
         // Split by dot and reverse: "www.qq.com" -> ["com", "qq", "www"]
         for part in domain_clean.rsplit('.') {
-            if part.is_empty() { continue; }
+            if part.is_empty() {
+                continue;
+            }
             node = node.children.entry(part.to_string()).or_default();
         }
         node.is_match = true;
@@ -86,7 +90,7 @@ impl DomainSet {
         if let Some(cached) = self.cache.get(domain_clean) {
             return cached;
         }
-        
+
         // 1. Trie Match (Suffix)
         let mut node = &self.root;
         for part in domain_clean.rsplit('.') {
@@ -202,13 +206,20 @@ impl GeoSitePlugin {
         self
     }
 
-    pub fn add_domain(&self, category: impl Into<String>, domain: impl Into<String>, r#type: domain::Type) {
+    pub fn add_domain(
+        &self,
+        category: impl Into<String>,
+        domain: impl Into<String>,
+        r#type: domain::Type,
+    ) {
         let category = category.into().to_lowercase();
         let domain = domain.into();
-        
+
         let mut categories = self.categories.write();
-        let set = categories.entry(category).or_insert_with(DomainSet::default);
-        
+        let set = categories
+            .entry(category)
+            .or_insert_with(DomainSet::default);
+
         match r#type {
             domain::Type::Plain => set.add_plain(domain),
             // Treat all others as Suffix (Trie) for performance and coverage
@@ -218,11 +229,11 @@ impl GeoSitePlugin {
 
     pub fn load_from_file(&self, path: impl Into<String>) -> Result<()> {
         let path_str = path.into();
-        
+
         if let Some((file_path, tag)) = path_str.split_once(':') {
             let path_buf = PathBuf::from(file_path);
             let ext = path_buf.extension().and_then(|s| s.to_str()).unwrap_or("");
-            
+
             if ext == "dat" {
                 return self.load_binary_category(&path_buf, tag);
             } else {
@@ -242,7 +253,7 @@ impl GeoSitePlugin {
     fn load_binary_category(&self, path: &PathBuf, target_tag: &str) -> Result<()> {
         let data = fs::read(path)?;
         let list = GeoSiteList::decode(&data[..])?;
-        
+
         let target = target_tag.to_lowercase();
         let mut count = 0;
 
@@ -255,17 +266,22 @@ impl GeoSitePlugin {
                         0 => domain::Type::Plain,
                         _ => domain::Type::RootDomain, // Treat Full/Regex/Domain as Suffix
                     };
-                    self.add_domain(&entry.country_code, d.value, r#type);
+                    self.add_domain(&self.target_category, d.value, r#type); // 🔧 Fix: 存储到 target_category，不是 source category
                     count += 1;
                 }
             }
         }
 
         if count > 0 {
-            info!("📂 GeoSite (Trie): Loaded {} domains for category '{}' from {:?}", 
-                  count, self.target_category, path);
+            info!(
+                "📂 GeoSite (Trie): Loaded {} domains for category '{}' from {:?}",
+                count, self.target_category, path
+            );
         } else {
-            warn!("⚠️  GeoSite: Category '{}' NOT FOUND in {:?}", target_tag, path);
+            warn!(
+                "⚠️  GeoSite: Category '{}' NOT FOUND in {:?}",
+                target_tag, path
+            );
         }
         Ok(())
     }
@@ -273,7 +289,7 @@ impl GeoSitePlugin {
     fn load_binary(&self, path: &PathBuf) -> Result<()> {
         let data = fs::read(path)?;
         let list = GeoSiteList::decode(&data[..])?;
-        
+
         let target = self.target_category.as_str();
         let mut count = 0;
 
@@ -285,14 +301,16 @@ impl GeoSitePlugin {
                         0 => domain::Type::Plain,
                         _ => domain::Type::RootDomain,
                     };
-                    self.add_domain(&entry.country_code, d.value, r#type);
+                    self.add_domain(&self.target_category, d.value, r#type); // 🔧 Fix: 存储到 target_category
                     count += 1;
                 }
             }
         }
 
-        info!("📂 GeoSite (Trie): Loaded {} domains for category '{}' from {:?}", 
-              count, self.target_category, path);
+        info!(
+            "📂 GeoSite (Trie): Loaded {} domains for category '{}' from {:?}",
+            count, self.target_category, path
+        );
         Ok(())
     }
 
@@ -301,7 +319,9 @@ impl GeoSitePlugin {
 
         for line in content.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('#') { continue; }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
 
             if let Some((category, domain)) = line.split_once(':') {
                 self.add_domain(category.trim(), domain.trim(), domain::Type::RootDomain);
@@ -317,7 +337,7 @@ impl GeoSitePlugin {
     pub fn matches(&self, domain: &str) -> bool {
         let categories = self.categories.read();
         let target = &self.target_category;
-        
+
         if let Some(set) = categories.get(target) {
             set.matches(domain)
         } else {
@@ -352,7 +372,7 @@ impl Plugin for GeoSitePlugin {
 
             if matched {
                 // tracing::info!("🌍 GeoMatch [{}]: {}", self.target_category, ctx.qname_ref());
-                
+
                 if let Some(mark) = &self.mark {
                     ctx.add_tag(mark);
                     tracing::debug!("✅ Added tag '{}' to context", mark);

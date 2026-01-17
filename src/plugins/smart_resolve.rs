@@ -5,7 +5,7 @@
 use crate::core::context::Context;
 use crate::core::plugin::Plugin;
 use crate::config::UpstreamConfig;
-use crate::plugins::forward::Upstream;
+use crate::plugins::forward::{ForwardTuning, Upstream};
 use anyhow::{Result, Context as AnyhowContext};
 use hickory_proto::op::Message;
 use hickory_proto::rr::{RData, Record, RecordType};
@@ -46,7 +46,8 @@ impl SmartResolvePlugin {
     ) -> Result<Self> {
         let mut upstreams = Vec::new();
         for conf in upstream_configs {
-            let upstream = Upstream::new(conf).context("Failed to create upstream")?;
+            let upstream =
+                Upstream::new(conf, &ForwardTuning::default()).context("Failed to create upstream")?;
             upstreams.push(Arc::new(upstream));
         }
 

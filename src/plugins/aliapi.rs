@@ -23,6 +23,7 @@ pub struct AliApiPlugin {
     pub access_key_secret: String,
     pub server_addr: String,
     pub client: Client,
+    pub timeout: std::time::Duration,
 }
 
 /// AliDNS JSON API Response Format
@@ -132,7 +133,7 @@ impl Plugin for AliApiPlugin {
 
         // Execute Request
         let resp = self.client.get(&url)
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(self.timeout)
             .send().await?;
         
         if !resp.status().is_success() {
@@ -220,7 +221,15 @@ impl Plugin for AliApiPlugin {
 }
 
 impl AliApiPlugin {
-    pub fn new(account_id: String, access_key_id: String, access_key_secret: String) -> Self {
+    pub fn new(
+        account_id: String,
+        access_key_id: String,
+        access_key_secret: String,
+        timeout_ms: Option<u64>,
+    ) -> Self {
+        let timeout = timeout_ms
+            .map(std::time::Duration::from_millis)
+            .unwrap_or_else(|| std::time::Duration::from_secs(5));
         Self {
             name: "aliapi".to_string(),
             account_id,
@@ -228,6 +237,7 @@ impl AliApiPlugin {
             access_key_secret,
             server_addr: "223.5.5.5".to_string(), // Default to public AliDNS
             client: Client::new(),
+            timeout,
         }
     }
     

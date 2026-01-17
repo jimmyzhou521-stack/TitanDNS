@@ -7,7 +7,7 @@ pub struct CachePluginConfig {
     pub size: usize, // Max items
     #[serde(default)]
     pub fakeip_protection: bool, // Prevent caching fake IPs?
-    
+
     // --- Smart Prefetch ---
     #[serde(default)]
     pub upstreams: Vec<UpstreamConfig>, // Who to ask for refresh?
@@ -26,12 +26,24 @@ pub struct CachePluginConfig {
     pub persist_interval: u64, // How often to save to disk (seconds), default 300
 }
 
-fn default_persist_interval() -> u64 { 300 }
-fn default_probe_timeout() -> u64 { 100 }
-fn default_probe_port() -> u16 { 80 }
-fn default_max_probes() -> usize { 5 }
-fn default_dga_entropy() -> f64 { 4.5 }
-fn default_dga_min_len() -> usize { 12 }
+fn default_persist_interval() -> u64 {
+    300
+}
+fn default_probe_timeout() -> u64 {
+    100
+}
+fn default_probe_port() -> u16 {
+    80
+}
+fn default_max_probes() -> usize {
+    5
+}
+fn default_dga_entropy() -> f64 {
+    4.5
+}
+fn default_dga_min_len() -> usize {
+    12
+}
 /// Root Configuration
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
@@ -132,8 +144,12 @@ impl Default for QueryLogConfig {
     }
 }
 
-fn default_query_log_size() -> usize { 5000 }
-fn default_recent_blocked_limit() -> usize { 100 }
+fn default_query_log_size() -> usize {
+    5000
+}
+fn default_recent_blocked_limit() -> usize {
+    100
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ApiConfig {
@@ -156,11 +172,11 @@ pub struct ServerConfig {
     pub protocol: Protocol,
     pub addr: String,
     pub entry: String, // Entry sequence tag
-    
+
     // Performance Tuning Options
     #[serde(default)]
     pub socket_opts: SocketOpts,
-    
+
     pub tls: Option<TlsConfig>,
 }
 
@@ -192,6 +208,12 @@ pub struct SocketOpts {
     pub batch_io: bool, // Enable recvmmsg
     #[serde(default = "default_workers")]
     pub workers: usize, // Number of parallel UDP workers (0 = auto-detect CPU cores)
+    #[serde(default)]
+    pub tcp_read_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub doh_keep_alive_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub doh_keep_alive_timeout_ms: Option<u64>,
 }
 
 fn default_workers() -> usize {
@@ -210,7 +232,7 @@ pub enum PluginType {
         #[serde(default)]
         dump_file: Option<String>,
         #[serde(default)]
-        fakeip_protection: bool,  // FakeIP 保护开关
+        fakeip_protection: bool, // FakeIP 保护开关
         #[serde(default)]
         upstreams: Vec<UpstreamConfig>,
         #[serde(default)]
@@ -220,17 +242,59 @@ pub enum PluginType {
         #[serde(default)]
         recursive_mode: bool,
         #[serde(default)]
-        persist_file: Option<String>,  // Path for disk persistence
+        persist_file: Option<String>, // Path for disk persistence
         #[serde(default = "default_persist_interval")]
-        persist_interval: u64,  // Interval in seconds for saving to disk
+        persist_interval: u64, // Interval in seconds for saving to disk
+        #[serde(default)]
+        min_ttl: Option<u64>,
+        #[serde(default)]
+        max_ttl: Option<u64>,
+        #[serde(default)]
+        moka_ttl_secs: Option<u64>, // Moka cache TTL (seconds)
+        #[serde(default)]
+        xdp_hash_ttl_secs: Option<u64>, // XDP hash map TTL (seconds)
+        #[serde(default)]
+        prefetch_concurrent: Option<usize>,
+        #[serde(default)]
+        prefetch_timeout_ms: Option<u64>,
+        #[serde(default)]
+        strategy: Option<String>, // Prefetch strategy for cache refresh
+        #[serde(default)]
+        timeout: Option<u64>, // Prefetch timeout in ms for cache refresh
     },
-    
+
     /// Forwarding (The core engine)
     #[serde(rename = "forward")]
     Forward {
         upstreams: Vec<UpstreamConfig>,
         concurrent: Option<usize>, // number of concurrent queries
         strategy: Option<String>,  // race, order, parallel
+        #[serde(default = "default_forward_timeout")]
+        timeout: u64, // timeout in milliseconds
+        #[serde(default)]
+        doh_pool_idle_timeout: Option<u64>, // seconds
+        #[serde(default)]
+        doh_pool_max_idle_per_host: Option<usize>,
+        #[serde(default)]
+        doh_timeout: Option<u64>, // seconds
+        #[serde(default)]
+        dot_idle_timeout: Option<u64>, // seconds
+        #[serde(default)]
+        doq_idle_timeout: Option<u64>, // seconds
+        #[serde(default)]
+        doq_socks5_timeout: Option<u64>, // seconds
+        #[serde(default)]
+        tcp_connect_timeout_ms: Option<u64>,
+        #[serde(default)]
+        tcp_read_timeout_ms: Option<u64>,
+        #[serde(default)]
+        udp_reply_timeout_ms: Option<u64>,
+        #[serde(default)]
+        udp_retries: Option<u32>,
+        #[serde(default)]
+        udp_rcvbuf: Option<usize>,
+        #[serde(default)]
+        udp_sndbuf: Option<usize>,
     },
 
     /// Reject/Blackhole Plugin (Ad-blocking, Blacklist)
@@ -249,8 +313,8 @@ pub enum PluginType {
     /// GeoSite Plugin (Domain Categorization)
     #[serde(rename = "geosite")]
     GeoSite {
-        target: String,      // Target category to match (e.g., "cn")
-        files: Vec<String>,  // List of geosite.dat/txt files to load
+        target: String,     // Target category to match (e.g., "cn")
+        files: Vec<String>, // List of geosite.dat/txt files to load
         #[serde(default)]
         mark: Option<String>, // Tag to add on match
     },
@@ -258,11 +322,11 @@ pub enum PluginType {
     /// GeoIP Plugin (IP-based Tagging)
     #[serde(rename = "geoip")]
     GeoIp {
-        file: String,        // Path to Country.mmdb
-        code: String,        // ISO Country Code (e.g. "cn")
-        tag: String,         // Tag to add if match
+        file: String, // Path to Country.mmdb
+        code: String, // ISO Country Code (e.g. "cn")
+        tag: String,  // Tag to add if match
         #[serde(default)]
-        mode: String,        // "client" or "response" (default: response)
+        mode: String, // "client" or "response" (default: response)
         #[serde(default)]
         invert: bool,
     },
@@ -270,7 +334,7 @@ pub enum PluginType {
     /// Matcher Plugin (Domain List Matching)
     #[serde(rename = "matcher")]
     Matcher {
-        files: Vec<String>,  // List of rule files (one domain per line)
+        files: Vec<String>, // List of rule files (one domain per line)
         #[serde(default)]
         mark: Option<String>, // Optional tag to add on match
     },
@@ -278,7 +342,7 @@ pub enum PluginType {
     /// IP Matcher Plugin (CIDR List Matching for Response IPs)
     #[serde(rename = "ip_matcher")]
     IpMatcher {
-        files: Vec<String>,  // List of CIDR rule files (one CIDR per line, e.g., 1.0.1.0/24)
+        files: Vec<String>, // List of CIDR rule files (one CIDR per line, e.g., 1.0.1.0/24)
         #[serde(default)]
         mark: Option<String>, // Optional tag to add on match
     },
@@ -286,10 +350,10 @@ pub enum PluginType {
     /// Fallback Plugin (Primary/Secondary failover)
     #[serde(rename = "fallback")]
     Fallback {
-        primary: String,     // Primary upstream plugin name
-        secondary: String,   // Secondary upstream plugin name
+        primary: String,   // Primary upstream plugin name
+        secondary: String, // Secondary upstream plugin name
         #[serde(default = "default_fallback_threshold")]
-        threshold: u64,      // Timeout in ms before switching to secondary
+        threshold: u64, // Timeout in ms before switching to secondary
         #[serde(default)]
         always_standby: bool, // If true, always query both in parallel
     },
@@ -298,7 +362,7 @@ pub enum PluginType {
     #[serde(rename = "ecs")]
     Ecs {
         #[serde(default)]
-        auto: bool,          // Auto-detect client IP
+        auto: bool, // Auto-detect client IP
         ipv4_netmask: Option<u8>,
         ipv6_netmask: Option<u8>,
         force_subnet: Option<String>, // Manually specify subnet
@@ -308,9 +372,9 @@ pub enum PluginType {
     #[serde(rename = "fakeip")]
     FakeIp {
         #[serde(default = "default_fakeip_v4_range")]
-        inet4_range: String,    // e.g., "7.0.0.0/8"
+        inet4_range: String, // e.g., "7.0.0.0/8"
         #[serde(default = "default_fakeip_v6_range")]
-        inet6_range: String,    // e.g., "fc00::/18"
+        inet6_range: String, // e.g., "fc00::/18"
     },
 
     /// SmartForward Plugin (Experimental)
@@ -349,6 +413,8 @@ pub enum PluginType {
         #[serde(default)]
         avoid_fakeip_on_domestic: bool,
         #[serde(default)]
+        prefer_local_on_miss: bool,
+        #[serde(default)]
         domestic_suffixes: Vec<String>,
         #[serde(default)]
         ip_matcher: Option<String>, // Reference to an IpMatcher plugin (optional, for speed)
@@ -356,37 +422,65 @@ pub enum PluginType {
         /// [新增] Learning Cache 持久化文件路径
         #[serde(default)]
         learning_cache_file: Option<String>,
+        /// Learning cache 最大条目数 (默认 10000)
+        #[serde(default)]
+        learning_cache_max_entries: Option<usize>,
+        /// Learning cache TTL 秒数 (默认 3600)
+        #[serde(default)]
+        learning_cache_ttl_secs: Option<u64>,
+        #[serde(default)]
+        doh_pool_idle_timeout: Option<u64>, // seconds
+        #[serde(default)]
+        doh_pool_max_idle_per_host: Option<usize>,
+        #[serde(default)]
+        doh_timeout: Option<u64>, // seconds
+        #[serde(default)]
+        dot_idle_timeout: Option<u64>, // seconds
+        #[serde(default)]
+        doq_idle_timeout: Option<u64>, // seconds
+        #[serde(default)]
+        doq_socks5_timeout: Option<u64>, // seconds
+        #[serde(default)]
+        tcp_connect_timeout_ms: Option<u64>,
+        #[serde(default)]
+        tcp_read_timeout_ms: Option<u64>,
+        #[serde(default)]
+        udp_reply_timeout_ms: Option<u64>,
+        #[serde(default)]
+        udp_retries: Option<u32>,
+        #[serde(default)]
+        udp_rcvbuf: Option<usize>,
+        #[serde(default)]
+        udp_sndbuf: Option<usize>,
     },
 
     /// DNS64 Plugin (IPv4 to IPv6 translation)
     #[serde(rename = "dns64")]
     Dns64 {
         #[serde(default)]
-        prefix: Option<String>,  // NAT64 prefix (default: 64:ff9b::/96)
+        prefix: Option<String>, // NAT64 prefix (default: 64:ff9b::/96)
         #[serde(default = "default_true")]
-        only_if_no_aaaa: bool,   // Only synthesize if no AAAA records exist
+        only_if_no_aaaa: bool, // Only synthesize if no AAAA records exist
     },
 
     /// DNSSEC Validation Plugin
     #[serde(rename = "dnssec")]
     Dnssec {
         #[serde(default = "default_dnssec_mode")]
-        mode: String,  // "strict", "permissive", or "log"
+        mode: String, // "strict", "permissive", or "log"
     },
 
     /// AdBlock Plugin (AdGuard syntax support)
     #[serde(rename = "adblock")]
-    AdBlock {
-        files: Vec<String>,
-    },
+    AdBlock { files: Vec<String> },
 
     /// IPv6 Filter Plugin (IPv4/IPv6 priority control)
     #[serde(rename = "ipv6_filter")]
     Ipv6Filter {
         #[serde(default = "default_ipv6_filter_mode")]
-        mode: String,  // "prefer_ipv4", "prefer_ipv6", "disable_ipv6", "disabled"
+        mode: String, // "prefer_ipv4", "prefer_ipv6", "disable_ipv6", "disabled"
         #[serde(default = "default_ipv6_delay")]
-        delay_aaaa_ms: u64,  // Delay in ms for AAAA responses (prefer_ipv4 mode)
+        delay_aaaa_ms: u64, // Delay in ms for AAAA responses (prefer_ipv4 mode)
     },
 
     /// DGA (Domain Generation Algorithm) Detection
@@ -403,33 +497,33 @@ pub enum PluginType {
     /// SmartResolve Plugin (Concurrent Query + Speed-Based IP Selection)
     #[serde(rename = "smart_resolve")]
     SmartResolve {
-        upstreams: Vec<UpstreamConfig>,  // Multiple upstreams to query concurrently
+        upstreams: Vec<UpstreamConfig>, // Multiple upstreams to query concurrently
         #[serde(default = "default_probe_timeout")]
-        probe_timeout_ms: u64,           // Timeout for IP probing (default: 100ms)
+        probe_timeout_ms: u64, // Timeout for IP probing (default: 100ms)
         #[serde(default = "default_probe_port")]
-        probe_port: u16,                 // Port for TCP probe (default: 80)
+        probe_port: u16, // Port for TCP probe (default: 80)
         #[serde(default = "default_true")]
-        prefer_ipv4: bool,               // Prefer IPv4 results
+        prefer_ipv4: bool, // Prefer IPv4 results
         #[serde(default = "default_max_probes")]
-        max_ips_to_probe: usize,         // Max IPs to probe (default: 5)
+        max_ips_to_probe: usize, // Max IPs to probe (default: 5)
     },
 
     /// TTL Modifier Plugin (Extend cache lifetime)
     #[serde(rename = "ttl")]
     Ttl {
         #[serde(default)]
-        fixed: Option<u32>,     // Fixed TTL value (overrides min/max)
+        fixed: Option<u32>, // Fixed TTL value (overrides min/max)
         #[serde(default)]
-        min: Option<u32>,       // Minimum TTL
+        min: Option<u32>, // Minimum TTL
         #[serde(default)]
-        max: Option<u32>,       // Maximum TTL
+        max: Option<u32>, // Maximum TTL
     },
 
     /// Rate Limiting Plugin (QPS protection)
     #[serde(rename = "ratelimit")]
     RateLimit {
-        max_queries: u32,     // Maximum queries per window per IP
-        window_secs: u64,     // Time window in seconds
+        max_queries: u32, // Maximum queries per window per IP
+        window_secs: u64, // Time window in seconds
     },
 
     /// Aliyun HTTPDNS API Plugin (Ultra-low latency)
@@ -438,6 +532,8 @@ pub enum PluginType {
         account_id: String,
         access_key_id: String,
         access_key_secret: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
     },
 
     /// Any other legacy generic plugin
@@ -452,9 +548,11 @@ pub struct UpstreamConfig {
     pub socks5: Option<String>,    // Proxy support
     pub idle_timeout: Option<u64>,
     #[serde(default)]
-    pub so_mark: Option<u32>,      // Kernel socket mark (fwmark)
+    pub query_timeout_ms: Option<u64>,
     #[serde(default)]
-    pub tcp_fast_open: bool,       // Enable TCP Fast Open (TFO)
+    pub so_mark: Option<u32>, // Kernel socket mark (fwmark)
+    #[serde(default)]
+    pub tcp_fast_open: bool, // Enable TCP Fast Open (TFO)
 }
 
 /// A Step in a Sequence
@@ -464,10 +562,10 @@ pub struct SequenceStep {
     /// If these conditions match... (Implicit AND)
     #[serde(default)]
     pub matches: Vec<MatchCondition>,
-    
+
     /// Execute this plugin/sequence tag
-    pub exec: String, 
-    
+    pub exec: String,
+
     /// Arguments for the execution (optional overrides)
     pub args: Option<HashMap<String, String>>,
 }
@@ -477,23 +575,22 @@ pub struct SequenceStep {
 pub enum MatchCondition {
     /// Match specific QNames
     ByQname { qname: Vec<String> },
-    
+
     /// Match QType
     ByQtype { qtype: Vec<u16> },
-    
+
     /// Match Client IP
     ByClientIp { client_ip: Vec<String> },
-    
+
     /// Custom Tag matching
-    ByTag { 
+    ByTag {
         has_tag: String,
         #[serde(default)]
         invert: bool,
     },
-    
+
     /// Match using a Matcher plugin
     ByMatcherPlugin { match_plugin: String },
-    
 }
 
 fn default_log_level() -> String {
@@ -505,7 +602,7 @@ fn default_reject_rcode() -> String {
 }
 
 fn default_fallback_threshold() -> u64 {
-    400  // 400ms default timeout
+    400 // 400ms default timeout
 }
 
 fn default_fakeip_v4_range() -> String {
@@ -529,5 +626,9 @@ fn default_ipv6_filter_mode() -> String {
 }
 
 fn default_ipv6_delay() -> u64 {
-    50  // 50ms default delay for AAAA
+    50 // 50ms default delay for AAAA
+}
+
+fn default_forward_timeout() -> u64 {
+    5000 // 5000ms default timeout for forward plugin
 }
