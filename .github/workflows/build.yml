@@ -1,10 +1,8 @@
 name: build
 
 on:
-  push:
-    branches: ["online"]
-  pull_request:
-    branches: ["online"]
+  # 只在手动触发时构建（用于测试）
+  # 正式发布请使用 tag 触发 release.yml
   workflow_dispatch:
 
 jobs:
