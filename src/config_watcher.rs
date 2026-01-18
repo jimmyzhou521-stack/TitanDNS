@@ -51,7 +51,7 @@ impl ConfigWatcher {
 
                 let mut watcher = match notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
                     if let Ok(event) = res {
-                        let _ = event_tx.blocking_send(event);
+                        let _ = event_tx.try_send(event);
                     }
                 }) {
                     Ok(w) => w,

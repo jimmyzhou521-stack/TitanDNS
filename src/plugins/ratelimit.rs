@@ -6,6 +6,7 @@ use anyhow::Result;
 use dashmap::DashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
@@ -31,6 +32,7 @@ pub struct RateLimitPlugin {
     pub window_secs: u64,
     /// IP 限流表
     limits: Arc<DashMap<IpAddr, RateLimitEntry>>,
+    cleanup_started: Arc<AtomicBool>,
 }
 
 impl RateLimitPlugin {
@@ -40,6 +42,7 @@ impl RateLimitPlugin {
             max_queries,
             window_secs,
             limits: Arc::new(DashMap::new()),
+            cleanup_started: Arc::new(AtomicBool::new(false)),
         };
         
         // [FIX] Start background cleanup task
@@ -50,22 +53,35 @@ impl RateLimitPlugin {
 
     /// [NEW] Start background cleanup task (runs every 2x window duration)
     fn start_cleanup_task(&self) {
+        if self
+            .cleanup_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.cleanup_started.store(false, Ordering::Release);
+            return;
+        }
+
         let limits = self.limits.clone();
         let window_secs = self.window_secs;
-        
+
         tokio::spawn(async move {
             let cleanup_interval = Duration::from_secs(window_secs * 2);
             loop {
                 tokio::time::sleep(cleanup_interval).await;
-                
+
                 let now = Instant::now();
                 let window_duration = Duration::from_secs(window_secs);
                 let before = limits.len();
-                
+
                 limits.retain(|_, entry| {
                     now.duration_since(entry.window_start) < window_duration * 2
                 });
-                
+
                 let after = limits.len();
                 if before > after {
                     tracing::debug!("🧹 RateLimit cleanup: {} -> {} entries", before, after);
@@ -127,6 +143,7 @@ impl Plugin for RateLimitPlugin {
     }
 
     async fn handle(&self, ctx: &mut Context) -> Result<()> {
+        self.start_cleanup_task();
         // 从 context 获取客户端 IP
         let client_ip = ctx.client_addr.ip();
 
@@ -156,6 +173,7 @@ impl Clone for RateLimitPlugin {
             max_queries: self.max_queries,
             window_secs: self.window_secs,
             limits: self.limits.clone(),
+            cleanup_started: self.cleanup_started.clone(),
         }
     }
 }

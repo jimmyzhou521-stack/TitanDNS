@@ -22,6 +22,8 @@ pub struct Socks5UdpTunnel {
     relay_addr: Arc<Mutex<Option<SocketAddr>>>,
     /// Local UDP socket for sending/receiving
     local_socket: Arc<Mutex<Option<UdpSocket>>>,
+    /// Reusable receive buffer to reduce allocations
+    recv_buf: Arc<Mutex<Vec<u8>>>,
 }
 
 impl Socks5UdpTunnel {
@@ -31,6 +33,7 @@ impl Socks5UdpTunnel {
             control_conn: Arc::new(Mutex::new(None)),
             relay_addr: Arc::new(Mutex::new(None)),
             local_socket: Arc::new(Mutex::new(None)),
+            recv_buf: Arc::new(Mutex::new(Vec::with_capacity(2048))),
         }
     }
 
@@ -153,43 +156,63 @@ impl Socks5UdpTunnel {
         let socket = self.local_socket.lock().await;
         let socket = socket.as_ref().ok_or_else(|| anyhow::anyhow!("Tunnel not connected"))?;
 
-        let mut recv_buf = vec![0u8; 65535];
-        let len = socket.recv(&mut recv_buf).await?;
-
-        if len < 10 {
-            return Err(anyhow::anyhow!("Invalid SOCKS5 UDP response"));
-        }
-
-        // Parse header
-        // RSV(2) FRAG(1) ATYP(1) ...
-        let atyp = recv_buf[3];
-        let (addr, data_offset) = match atyp {
-            0x01 => {
-                // IPv4
-                let ip = std::net::Ipv4Addr::new(recv_buf[4], recv_buf[5], recv_buf[6], recv_buf[7]);
-                let port = u16::from_be_bytes([recv_buf[8], recv_buf[9]]);
-                (SocketAddr::new(ip.into(), port), 10)
-            }
-            0x04 => {
-                // IPv6
-                let mut ip_bytes = [0u8; 16];
-                ip_bytes.copy_from_slice(&recv_buf[4..20]);
-                let ip = std::net::Ipv6Addr::from(ip_bytes);
-                let port = u16::from_be_bytes([recv_buf[20], recv_buf[21]]);
-                (SocketAddr::new(ip.into(), port), 22)
-            }
-            _ => return Err(anyhow::anyhow!("Unsupported ATYP in response")),
+        let mut recv_buf = {
+            let mut guard = self.recv_buf.lock().await;
+            std::mem::take(&mut *guard)
         };
-
-        let data_len = len - data_offset;
-        if data_len > buf.len() {
-            return Err(anyhow::anyhow!("Buffer too small"));
+        let desired = buf.len().saturating_add(64);
+        if recv_buf.len() < desired {
+            recv_buf.resize(desired, 0);
+        } else {
+            recv_buf.truncate(desired);
         }
 
-        buf[..data_len].copy_from_slice(&recv_buf[data_offset..len]);
-        Ok((data_len, addr))
-    }
+        let len = socket.recv(&mut recv_buf).await?;
+        let data = &recv_buf[..len];
 
+        let result = (|| {
+            if len < 10 {
+                return Err(anyhow::anyhow!("Invalid SOCKS5 UDP response"));
+            }
+
+            // Parse header
+            // RSV(2) FRAG(1) ATYP(1) ...
+            let atyp = data[3];
+            let (addr, data_offset) = match atyp {
+                0x01 => {
+                    // IPv4
+                    let ip = std::net::Ipv4Addr::new(data[4], data[5], data[6], data[7]);
+                    let port = u16::from_be_bytes([data[8], data[9]]);
+                    (SocketAddr::new(ip.into(), port), 10)
+                }
+                0x04 => {
+                    // IPv6
+                    if len < 22 {
+                        return Err(anyhow::anyhow!("Invalid SOCKS5 UDP response"));
+                    }
+                    let mut ip_bytes = [0u8; 16];
+                    ip_bytes.copy_from_slice(&data[4..20]);
+                    let ip = std::net::Ipv6Addr::from(ip_bytes);
+                    let port = u16::from_be_bytes([data[20], data[21]]);
+                    (SocketAddr::new(ip.into(), port), 22)
+                }
+                _ => return Err(anyhow::anyhow!("Unsupported ATYP in response")),
+            };
+
+            let data_len = len - data_offset;
+            if data_len > buf.len() {
+                return Err(anyhow::anyhow!("Buffer too small"));
+            }
+
+            buf[..data_len].copy_from_slice(&data[data_offset..len]);
+            Ok((data_len, addr))
+        })();
+
+        let mut guard = self.recv_buf.lock().await;
+        *guard = recv_buf;
+
+        result
+    }
     /// Check if tunnel is connected
     pub async fn is_connected(&self) -> bool {
         self.relay_addr.lock().await.is_some()

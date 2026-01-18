@@ -12,6 +12,7 @@ use hickory_proto::rr::{RData, Record, RecordType};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use futures::stream::{self, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -148,22 +149,25 @@ impl SmartResolvePlugin {
     async fn concurrent_query(&self, request: &Message) -> Vec<Record> {
         let (tx, mut rx) = mpsc::channel::<Vec<Record>>(self.upstreams.len());
         let individual_timeout = Duration::from_millis(1500);
+        let max_concurrency = std::cmp::max(1, std::cmp::min(self.upstreams.len(), 32));
+        let request = request.clone();
 
-        for upstream in &self.upstreams {
-            let upstream = upstream.clone();
-            let request = request.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                if let Ok(Ok(response)) = tokio::time::timeout(individual_timeout, upstream.exchange(&request)).await {
-                    let records: Vec<Record> = response.answers().iter()
-                        .filter(|r| matches!(r.record_type(), RecordType::A | RecordType::AAAA))
-                        .cloned().collect();
-                    if !records.is_empty() {
-                        let _ = tx.send(records).await;
+        stream::iter(self.upstreams.iter().cloned())
+            .for_each_concurrent(max_concurrency, |upstream| {
+                let request = request.clone();
+                let tx = tx.clone();
+                async move {
+                    if let Ok(Ok(response)) = tokio::time::timeout(individual_timeout, upstream.exchange(&request)).await {
+                        let records: Vec<Record> = response.answers().iter()
+                            .filter(|r| matches!(r.record_type(), RecordType::A | RecordType::AAAA))
+                            .cloned().collect();
+                        if !records.is_empty() {
+                            let _ = tx.send(records).await;
+                        }
                     }
                 }
-            });
-        }
+            })
+            .await;
         drop(tx);
 
         let mut all_records = Vec::new();
@@ -179,7 +183,6 @@ impl SmartResolvePlugin {
         }
         all_records
     }
-
     fn extract_ip(record: &Record) -> Option<IpAddr> {
         match record.data() {
             RData::A(a) => Some(IpAddr::V4(a.0)),
@@ -206,31 +209,32 @@ impl SmartResolvePlugin {
 
         let max_new = self.max_ips_to_probe.saturating_sub(cached_results.len());
         if max_new > 0 && !ips_to_probe.is_empty() {
-             let (tx, mut rx) = mpsc::channel::<IpWithLatency>(max_new);
-             let probe_timeout = Duration::from_millis(self.probe_timeout_ms);
-             // Default probe port is usually 443, but we can try 80 if 443 fails? 
-             // Simpler: Just probe configured port.
-             let port = self.probe_port;
+            let (tx, mut rx) = mpsc::channel::<IpWithLatency>(max_new);
+            let probe_timeout = Duration::from_millis(self.probe_timeout_ms);
+            let port = self.probe_port;
+            let max_concurrency = std::cmp::max(1, std::cmp::min(max_new, 32));
 
-             for record in ips_to_probe.into_iter().take(max_new) {
-                 if let Some(ip) = Self::extract_ip(&record) {
-                     let tx = tx.clone();
-                     let record = record.clone();
-                     tokio::spawn(async move {
-                         let addr = SocketAddr::new(ip, port);
-                         let start = Instant::now();
-                         let latency = match tokio::time::timeout(probe_timeout, TcpStream::connect(addr)).await {
-                             Ok(Ok(_)) => start.elapsed().as_millis() as u64,
-                             _ => u64::MAX,
-                         };
-                         let _ = tx.send(IpWithLatency { ip, latency_ms: latency, record }).await;
-                     });
-                 }
-             }
-             drop(tx);
-             while let Some(res) = rx.recv().await {
-                 cached_results.push(res);
-             }
+            stream::iter(ips_to_probe.into_iter().take(max_new))
+                .for_each_concurrent(max_concurrency, |record| {
+                    let tx = tx.clone();
+                    async move {
+                        if let Some(ip) = Self::extract_ip(&record) {
+                            let addr = SocketAddr::new(ip, port);
+                            let start = Instant::now();
+                            let latency = match tokio::time::timeout(probe_timeout, TcpStream::connect(addr)).await {
+                                Ok(Ok(_)) => start.elapsed().as_millis() as u64,
+                                _ => u64::MAX,
+                            };
+                            let _ = tx.send(IpWithLatency { ip, latency_ms: latency, record }).await;
+                        }
+                    }
+                })
+                .await;
+            drop(tx);
+
+            while let Some(res) = rx.recv().await {
+                cached_results.push(res);
+            }
         }
 
         cached_results.sort_by_key(|r| r.latency_ms);
@@ -242,13 +246,11 @@ impl SmartResolvePlugin {
         }
 
         let sorted: Vec<Record> = cached_results.into_iter().map(|r| r.record).collect();
-        // Append any skipped records
         if sorted.len() < records.len() {
              // simplified append not implementing precise tracking for now
         }
         sorted
     }
-
     fn build_response(&self, request: &Message, sorted_records: Vec<Record>) -> Message {
         let mut response = Message::new();
         response.set_id(request.id());

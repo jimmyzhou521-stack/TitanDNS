@@ -260,8 +260,13 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 }
-                match crate::config::Config::load_from_file(&args.config) {
-                    Ok(new_config) => {
+                let config_path_clone = args.config.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::config::Config::load_from_file(&config_path_clone)
+                })
+                .await
+                {
+                    Ok(Ok(new_config)) => {
                         let ac_nc = Arc::new(new_config.clone());
                         
                         // 1. Send Update to UDP Workers
@@ -287,8 +292,9 @@ async fn main() -> Result<()> {
                         
                         // config = new_config; // Removed unused assignment
                         info!("✅ Hot Reload applied successfully!");
-                    },
-                    Err(e) => error!("❌ Failed to load new config: {}", e),
+                    }
+                    Ok(Err(e)) => error!("❌ Failed to load new config: {}", e),
+                    Err(e) => error!("❌ Failed to load new config (join error): {}", e),
                 }
             }
         }
@@ -771,4 +777,3 @@ pub fn setup_logging_with_file(level: Level, log_file: &str) {
     
     info!("📝 Log rotation enabled: {} (daily)", log_file);
 }
-

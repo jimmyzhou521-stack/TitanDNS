@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use futures::stream::{self, StreamExt};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use hickory_proto::op::Message;
@@ -117,41 +118,51 @@ impl HealthChecker {
         msg.set_message_type(MessageType::Query);
         msg.set_op_code(OpCode::Query);
         msg.set_recursion_desired(true);
-        
+
         if let Ok(name) = Name::from_ascii("health.check.local") {
             let query = Query::query(name, RecordType::A);
             msg.add_query(query);
         }
 
-        for upstream in &self.upstreams {
-            let start = Instant::now();
-            
-            // Simple UDP probe (we don't actually need a response)
-            let result = tokio::time::timeout(
-                self.probe_timeout,
-                self.probe_upstream(&upstream.label, &msg)
-            ).await;
+        let msg = Arc::new(msg);
+        let probe_timeout = self.probe_timeout;
+        let max_concurrency = std::cmp::max(1, std::cmp::min(self.upstreams.len(), 32));
+        let this = self;
 
-            *upstream.last_check.write().await = Instant::now();
+        stream::iter(self.upstreams.iter().cloned())
+            .for_each_concurrent(max_concurrency, |upstream| {
+                let msg = Arc::clone(&msg);
+                async move {
+                    let start = Instant::now();
 
-            match result {
-                Ok(Ok(())) => {
-                    let latency = start.elapsed().as_millis() as u64;
-                    upstream.mark_success(latency);
-                    debug!("✅ Health check passed: {} ({}ms)", upstream.label, latency);
+                    // Simple UDP probe (we don't actually need a response)
+                    let result = tokio::time::timeout(
+                        probe_timeout,
+                        this.probe_upstream(&upstream.label, msg.as_ref())
+                    )
+                    .await;
+
+                    *upstream.last_check.write().await = Instant::now();
+
+                    match result {
+                        Ok(Ok(())) => {
+                            let latency = start.elapsed().as_millis() as u64;
+                            upstream.mark_success(latency);
+                            debug!("✅ Health check passed: {} ({}ms)", upstream.label, latency);
+                        }
+                        Ok(Err(e)) => {
+                            upstream.mark_failure();
+                            debug!("❌ Health check failed: {} - {}", upstream.label, e);
+                        }
+                        Err(_) => {
+                            upstream.mark_failure();
+                            debug!("❌ Health check timeout: {}", upstream.label);
+                        }
+                    }
                 }
-                Ok(Err(e)) => {
-                    upstream.mark_failure();
-                    debug!("❌ Health check failed: {} - {}", upstream.label, e);
-                }
-                Err(_) => {
-                    upstream.mark_failure();
-                    debug!("❌ Health check timeout: {}", upstream.label);
-                }
-            }
-        }
+            })
+            .await;
     }
-
     async fn probe_upstream(&self, label: &str, _msg: &Message) -> anyhow::Result<()> {
         // Simple socket connectivity check
         // For real implementation, send the DNS probe

@@ -10,7 +10,9 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::time::Duration;
+use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::sync::{mpsc, Mutex};
 use tracing::warn;
 
 use crate::core::context::Context;
@@ -20,6 +22,7 @@ use crate::core::plugin::Plugin;
 pub struct QueryLogPlugin {
     pub name: String,
     log_file: Arc<Mutex<Option<std::fs::File>>>,
+    log_tx: Option<mpsc::Sender<String>>,
     log_queries: bool,
     log_responses: bool,
 }
@@ -29,6 +32,7 @@ impl Clone for QueryLogPlugin {
         Self {
             name: self.name.clone(),
             log_file: self.log_file.clone(),
+            log_tx: self.log_tx.clone(),
             log_queries: self.log_queries,
             log_responses: self.log_responses,
         }
@@ -37,25 +41,84 @@ impl Clone for QueryLogPlugin {
 
 impl QueryLogPlugin {
     pub fn new(log_path: Option<PathBuf>, log_queries: bool, log_responses: bool) -> Result<Self> {
-        let log_file = if let Some(path) = log_path {
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?;
-            Some(file)
-        } else {
-            None
-        };
+        let mut log_file = None;
+        let mut log_tx = None;
+        if let Some(path) = log_path {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let (tx, mut rx) = mpsc::channel::<String>(1024);
+                tokio::spawn(async move {
+                    let file = match tokio::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .await
+                    {
+                        Ok(f) => f,
+                        Err(e) => {
+                            warn!("Failed to open query log file: {}", e);
+                            return;
+                        }
+                    };
+                    let mut writer = BufWriter::new(file);
+                    let mut pending = 0usize;
+                    let mut dirty = false;
+                    let mut interval = tokio::time::interval(Duration::from_millis(200));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tokio::select! {
+                            entry = rx.recv() => {
+                                let Some(entry) = entry else {
+                                    break;
+                                };
+                                if writer.write_all(entry.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                                if writer.write_all(b"\n").await.is_err() {
+                                    break;
+                                }
+                                pending += 1;
+                                dirty = true;
+                                if pending >= 32 {
+                                    let _ = writer.flush().await;
+                                    pending = 0;
+                                    dirty = false;
+                                }
+                            }
+                            _ = interval.tick() => {
+                                if dirty {
+                                    let _ = writer.flush().await;
+                                    pending = 0;
+                                    dirty = false;
+                                }
+                            }
+                        }
+                    }
+                    let _ = writer.flush().await;
+                });
+                log_tx = Some(tx);
+            } else {
+                let file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)?;
+                log_file = Some(file);
+            }
+        }
 
         Ok(Self {
             name: "query_log".to_string(),
             log_file: Arc::new(Mutex::new(log_file)),
+            log_tx,
             log_queries,
             log_responses,
         })
     }
 
     async fn log_entry(&self, entry: String) {
+        if let Some(tx) = &self.log_tx {
+            let _ = tx.try_send(entry);
+            return;
+        }
         let mut file_guard = self.log_file.lock().await;
         if let Some(file) = file_guard.as_mut() {
             if let Err(e) = writeln!(file, "{}", entry) {

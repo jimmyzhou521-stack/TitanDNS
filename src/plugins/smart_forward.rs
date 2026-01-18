@@ -409,19 +409,22 @@ impl SmartForwardPlugin {
         if let Some(ref path) = self.persist_file {
             // Create parent directory if needed
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
+                tokio::fs::create_dir_all(parent).await?;
             }
 
-            // Read from persist_data shadow copy
-            let mut data: HashMap<String, bool> = HashMap::new();
-            for entry in self.persist_data.iter() {
-                data.insert(entry.key().clone(), *entry.value());
-            }
-            let count = data.len();
-
-            // Serialize and write to file
-            let json = serde_json::to_string_pretty(&data)?;
-            std::fs::write(path, json)?;
+            // Read + serialize in blocking thread to avoid stalling async runtime
+            let persist = self.persist_data.clone();
+            let (json, count) = tokio::task::spawn_blocking(move || -> Result<(String, usize)> {
+                let mut data: HashMap<String, bool> = HashMap::new();
+                for entry in persist.iter() {
+                    data.insert(entry.key().clone(), *entry.value());
+                }
+                let count = data.len();
+                let json = serde_json::to_string_pretty(&data)?;
+                Ok((json, count))
+            })
+            .await??;
+            tokio::fs::write(path, json).await?;
 
             info!(
                 "📦 SmartForward '{}': Saved {} learning entries to {:?}",
@@ -784,7 +787,6 @@ impl Plugin for SmartForwardPlugin {
                 {
                     Ok(mut resp) => {
                         let elapsed = start.elapsed().as_millis() as u64;
-                        crate::autopilot::record_success(local_label, elapsed);
                         crate::autopilot::record_domain_result_for_client_lower(
                             qname_lower,
                             local_label,
@@ -797,7 +799,6 @@ impl Plugin for SmartForwardPlugin {
                         return Ok(());
                     }
                     Err(_) => {
-                        crate::autopilot::record_failure(local_label);
                         warn!("⚠️ AI记忆命中但 Local 失败，回退探测流程: {}", qname);
                     }
                 }
@@ -817,7 +818,6 @@ impl Plugin for SmartForwardPlugin {
                     {
                         Ok(mut resp) => {
                             let elapsed = start.elapsed().as_millis() as u64;
-                            crate::autopilot::record_success(local_label, elapsed);
                             crate::autopilot::record_domain_result_for_client_lower(
                                 qname_lower,
                                 local_label,
@@ -831,7 +831,6 @@ impl Plugin for SmartForwardPlugin {
                             return Ok(());
                         }
                         Err(_) => {
-                            crate::autopilot::record_failure(local_label);
                             warn!("⚠️ 强制 Local 失败，回退探测流程: {}", qname);
                         }
                     }
@@ -844,7 +843,6 @@ impl Plugin for SmartForwardPlugin {
                     {
                         Ok(mut resp) => {
                             let elapsed = start.elapsed().as_millis() as u64;
-                            crate::autopilot::record_success(fake_label, elapsed);
                             crate::autopilot::record_domain_result_for_client_lower(
                                 qname_lower,
                                 fake_label,
@@ -857,7 +855,6 @@ impl Plugin for SmartForwardPlugin {
                             return Ok(());
                         }
                         Err(_) => {
-                            crate::autopilot::record_failure(fake_label);
                             warn!("⚠️ AI记忆命中但 FakeIP 失败，回退探测流程: {}", qname);
                         }
                     }
@@ -881,7 +878,6 @@ impl Plugin for SmartForwardPlugin {
                 {
                     Ok(mut resp) => {
                         let elapsed = start.elapsed().as_millis() as u64;
-                        crate::autopilot::record_success(local_label, elapsed);
                         crate::autopilot::record_domain_result_for_client_lower(
                             qname_lower,
                             local_label,
@@ -893,7 +889,6 @@ impl Plugin for SmartForwardPlugin {
                         return Ok(());
                     }
                     Err(_) => {
-                        crate::autopilot::record_failure(local_label);
                         warn!(
                             "⚠️ SmartForward (Cached): Local lookup failed. Falling back to probe."
                         );
@@ -916,7 +911,6 @@ impl Plugin for SmartForwardPlugin {
                     {
                         Ok(mut resp) => {
                             let elapsed = start.elapsed().as_millis() as u64;
-                            crate::autopilot::record_success(local_label, elapsed);
                             crate::autopilot::record_domain_result_for_client_lower(
                                 qname_lower,
                                 local_label,
@@ -929,7 +923,6 @@ impl Plugin for SmartForwardPlugin {
                             return Ok(());
                         }
                         Err(_) => {
-                            crate::autopilot::record_failure(local_label);
                             warn!("⚠️ 强制 Local 失败，回退探测流程: {}", qname);
                         }
                     }
@@ -946,7 +939,6 @@ impl Plugin for SmartForwardPlugin {
                     {
                         Ok(mut resp) => {
                             let elapsed = start.elapsed().as_millis() as u64;
-                            crate::autopilot::record_success(fake_label, elapsed);
                             crate::autopilot::record_domain_result_for_client_lower(
                                 qname_lower,
                                 fake_label,
@@ -958,7 +950,6 @@ impl Plugin for SmartForwardPlugin {
                             return Ok(());
                         }
                         Err(_) => {
-                            crate::autopilot::record_failure(fake_label);
                             warn!("⚠️ SmartForward (Cached): FakeIP lookup failed. Falling back to probe.");
                         }
                     }
@@ -984,7 +975,6 @@ impl Plugin for SmartForwardPlugin {
                 {
                     Ok(mut resp) => {
                         let elapsed = start.elapsed().as_millis() as u64;
-                        crate::autopilot::record_success(local_label, elapsed);
                         crate::autopilot::record_domain_result_for_client_lower(
                             qname_lower,
                             local_label,
@@ -996,7 +986,6 @@ impl Plugin for SmartForwardPlugin {
                         return Ok(());
                     }
                     Err(_) => {
-                        crate::autopilot::record_failure(local_label);
                         // If cached route fails, maybe fallback to standard logic?
                         // For now, let's fallthrough to standard probe as self-healing.
                         warn!("⚠️ SmartForward (Learned): Local lookup failed. Falling back to probe.");
@@ -1020,7 +1009,6 @@ impl Plugin for SmartForwardPlugin {
                     {
                         Ok(mut resp) => {
                             let elapsed = start.elapsed().as_millis() as u64;
-                            crate::autopilot::record_success(local_label, elapsed);
                             crate::autopilot::record_domain_result_for_client_lower(
                                 qname_lower,
                                 local_label,
@@ -1034,7 +1022,6 @@ impl Plugin for SmartForwardPlugin {
                             return Ok(());
                         }
                         Err(_) => {
-                            crate::autopilot::record_failure(local_label);
                             warn!("⚠️ 强制 Local 失败，回退探测流程: {}", qname);
                         }
                     }
@@ -1051,7 +1038,6 @@ impl Plugin for SmartForwardPlugin {
                     {
                         Ok(mut resp) => {
                             let elapsed = start.elapsed().as_millis() as u64;
-                            crate::autopilot::record_success(fake_label, elapsed);
                             crate::autopilot::record_domain_result_for_client_lower(
                                 qname_lower,
                                 fake_label,
@@ -1063,7 +1049,6 @@ impl Plugin for SmartForwardPlugin {
                             return Ok(());
                         }
                         Err(_) => {
-                            crate::autopilot::record_failure(fake_label);
                             warn!("⚠️ SmartForward (Learned): FakeIP lookup failed. Falling back to probe.");
                         }
                     }
@@ -1089,7 +1074,6 @@ impl Plugin for SmartForwardPlugin {
         match local_res {
             Ok(mut local_resp) => {
                 let probe_elapsed = probe_start.elapsed().as_millis() as u64;
-                crate::autopilot::record_success(local_label, probe_elapsed);
                 let (is_cn, has_ip) = self.classify_response(&local_resp).await;
 
                 // Decision Logic
@@ -1150,7 +1134,6 @@ impl Plugin for SmartForwardPlugin {
                 }
             }
             Err(e) => {
-                crate::autopilot::record_failure(local_label);
                 warn!(
                     "⚠️ SmartForward: Local probe failed ({}). Trying fallback...",
                     e
@@ -1168,7 +1151,6 @@ impl Plugin for SmartForwardPlugin {
                     {
                         Ok(mut fb_resp) => {
                             let fb_elapsed = fb_start.elapsed().as_millis() as u64;
-                            crate::autopilot::record_success(fb_label, fb_elapsed);
                             let (is_cn, has_ip) = self.classify_response(&fb_resp).await;
 
                             if is_cn {
@@ -1220,7 +1202,6 @@ impl Plugin for SmartForwardPlugin {
                             }
                         }
                         Err(err) => {
-                            crate::autopilot::record_failure(fb_label);
                             warn!(
                                 "⚠️ SmartForward: Fallback failed ({}). Continue FakeIP.",
                                 err
@@ -1275,7 +1256,6 @@ impl Plugin for SmartForwardPlugin {
                 let fake_elapsed = fake_start.elapsed().as_millis() as u64;
                 debug!("🎭 SmartForward: Returning FakeIP.");
                 STATS.record_strategy("Proxy");
-                crate::autopilot::record_success(fake_label, fake_elapsed);
                 crate::autopilot::record_domain_result_for_client_lower(
                     qname_lower,
                     fake_label,
@@ -1287,7 +1267,6 @@ impl Plugin for SmartForwardPlugin {
                 Ok(())
             }
             Err(e) => {
-                crate::autopilot::record_failure(fake_label);
                 warn!("❌ SmartForward: FakeIP upstream also failed: {}", e);
                 let mut resp = Message::new();
                 resp.set_id(id);

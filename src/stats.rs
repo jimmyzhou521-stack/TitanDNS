@@ -112,14 +112,12 @@ impl DnsStats {
             .or_insert(1);
         
         // Record latency sample (async-safe)
-        let samples = self.latency_samples.clone();
-        tokio::spawn(async move {
-            let mut guard = samples.write().await;
+        if let Ok(mut guard) = self.latency_samples.try_write() {
             if guard.len() >= 1000 {
                 guard.pop_front();
             }
             guard.push_back(latency_us);
-        });
+        }
 
         // Memory Protection: Prevent DashMap from indefinite growth
         // If we track too many distinct domains/clients (e.g. DDOS or random subdomains), clear stats.
@@ -150,16 +148,13 @@ impl DnsStats {
             timestamp: Utc::now().to_rfc3339(),
         };
         
-        let blocked = self.recent_blocked.clone();
         let limit = self.blocked_limit.load(Ordering::Relaxed);
-        
-        tokio::spawn(async move {
-            let mut guard = blocked.write().await;
+        if let Ok(mut guard) = self.recent_blocked.try_write() {
             if guard.len() >= limit {
                 guard.pop_front();
             }
             guard.push_back(entry);
-        });
+        }
 
         // Also record as a "Blocked" strategy
         self.record_strategy("Blocked");

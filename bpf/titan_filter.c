@@ -334,7 +334,6 @@ int titan_dns_filter(struct xdp_md *ctx) {
                 // Handle remaining bytes (tail)
                 // We use a switch/fallthrough or small byte copy
                 // For simplicity/safety, just copy byte-by-byte for the tail < 32
-                 #pragma unroll
                  for (int j = 0; j < 32; j++) {
                      if (len == 0) break;
                      if (payload + 1 > data_end) break;

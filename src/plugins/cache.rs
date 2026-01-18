@@ -11,6 +11,8 @@ use once_cell::sync::OnceCell;
 use crate::core::context::Context;
 use crate::core::plugin::Plugin;
 use crate::core::simd_hash::SimdDomainHasher;
+#[cfg(target_os = "linux")]
+use crate::core::task_manager::TaskManager;
 use crate::plugins::forward::ForwardPlugin; // Needed for prefetch
 use crate::config::UpstreamConfig;
 use crate::plugins::AnyPlugin;
@@ -168,6 +170,8 @@ pub struct CachePlugin {
     xdp_filter: Option<Arc<tokio::sync::Mutex<crate::bpf::DnsBpfFilter>>>,
     xdp_cache_enabled: bool,
     xdp_hash_map: moka::sync::Cache<u64, (String, u16, u16)>,
+    #[cfg(target_os = "linux")]
+    xdp_refresh_task_mgr: Option<Arc<TaskManager>>,
 }
 
 impl std::fmt::Debug for CachePlugin {
@@ -178,6 +182,15 @@ impl std::fmt::Debug for CachePlugin {
             .field("max_ttl", &self.max_ttl)
             .field("xdp_cache_enabled", &self.xdp_cache_enabled)
             .finish()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CachePlugin {
+    fn drop(&mut self) {
+        if let Some(mgr) = self.xdp_refresh_task_mgr.take() {
+            mgr.stop();
+        }
     }
 }
 
@@ -315,6 +328,8 @@ impl CachePlugin {
             xdp_filter: None,  // Will be set via set_xdp_filter()
             xdp_cache_enabled: false,
             xdp_hash_map,
+            #[cfg(target_os = "linux")]
+            xdp_refresh_task_mgr: None,
         };
 
         // Load cache from disk on startup
@@ -327,10 +342,28 @@ impl CachePlugin {
 
     /// Load cache entries from disk file
     fn load_from_disk(&self, path: &str) {
+        let path = path.to_string();
+        let cache = self.cache.clone();
+        let serve_stale_ttl = self.serve_stale_ttl;
+
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::spawn_blocking(move || {
+                Self::load_from_disk_blocking(cache, serve_stale_ttl, path);
+            });
+        } else {
+            Self::load_from_disk_blocking(cache, serve_stale_ttl, path);
+        }
+    }
+
+    fn load_from_disk_blocking(
+        cache: Cache<QueryKey, CachedEntry>,
+        serve_stale_ttl: u64,
+        path: String,
+    ) {
         use std::fs::File;
         use std::io::{BufReader, Read};
         
-        let file = match File::open(path) {
+        let file = match File::open(&path) {
             Ok(f) => f,
             Err(e) => {
                 info!("💾 No cache file found at {} ({}), starting fresh", path, e);
@@ -361,9 +394,9 @@ impl CachePlugin {
                     .unwrap_or_default()
                     .as_secs();
                 let elapsed = now.saturating_sub(entry.timestamp);
-                if elapsed < entry.ttl + self.serve_stale_ttl + 3600 { // Extra hour grace
+                if elapsed < entry.ttl + serve_stale_ttl + 3600 { // Extra hour grace
                     // Fix: Force async insert in sync function using block_on
-                    futures::executor::block_on(self.cache.insert(key, entry));
+                    futures::executor::block_on(cache.insert(key, entry));
                     count += 1;
                 }
             }
@@ -426,7 +459,14 @@ impl CachePlugin {
             let mut ticker = tokio::time::interval(Duration::from_secs(interval));
             loop {
                 ticker.tick().await;
-                self.save_to_disk();
+                let plugin = self.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    plugin.save_to_disk();
+                })
+                .await
+                {
+                    warn!("💾 Cache persistence task failed: {}", e);
+                }
             }
         });
     }
@@ -540,33 +580,38 @@ impl CachePlugin {
     // --- Persistence ---
 
     pub async fn dump_to_file(&self, path: &str) -> Result<()> {
-        use std::io::Write;
-        let mut file = std::fs::File::create(path)?;
-        let mut count = 0;
+        let path = path.to_string();
+        let path_log = path.clone();
+        let cache = self.cache.clone();
+        let count = tokio::task::spawn_blocking(move || -> Result<usize> {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&path)?;
+            let mut count = 0usize;
 
-        for (key, entry) in self.cache.iter() {
-            let key_bytes = key.to_bytes();
-            let entry_bytes = entry.to_bytes()?;
-            
-            file.write_all(&key_bytes)?;
-            file.write_all(&entry_bytes)?;
-            count += 1;
-        }
+            for (key, entry) in cache.iter() {
+                let key_bytes = key.to_bytes();
+                let entry_bytes = entry.to_bytes()?;
 
-        file.sync_all()?;
-        info!("💾 Cache dumped: {} entries saved to {}", count, path);
+                file.write_all(&key_bytes)?;
+                file.write_all(&entry_bytes)?;
+                count += 1;
+            }
+
+            file.sync_all()?;
+            Ok(count)
+        })
+        .await??;
+
+        info!("💾 Cache dumped: {} entries saved to {}", count, path_log);
         Ok(())
     }
 
     pub async fn load_from_file(&self, path: &str) -> Result<()> {
-        use std::io::Read;
-        if !std::path::Path::new(path).exists() {
-            return Ok(());
-        }
-
-        let mut file = std::fs::File::open(path)?;
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)?;
+        let buf = match tokio::fs::read(path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
 
         let mut offset = 0;
         let mut count = 0;
@@ -642,25 +687,35 @@ impl CachePlugin {
         let xdp_hash_map = self.xdp_hash_map.clone();
         let xdp_enabled = self.xdp_cache_enabled;
         let plugin_name = self.name.clone();
+        let plugin_name_task = plugin_name.clone();
+
+        // Stop previous refresh task if any
+        if let Some(mgr) = self.xdp_refresh_task_mgr.take() {
+            mgr.stop();
+        }
+
+        let task_mgr = Arc::new(TaskManager::new());
+        self.xdp_refresh_task_mgr = Some(task_mgr.clone());
 
         // Start Background Task: Stats + Shadow Refresh Polling
-        tokio::spawn(async move {
+        let started = task_mgr.start(move |shutdown| async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1)); // Poll every 1 second
             let mut stats_interval_counter = 0u32;
-            
+
             // Only sync stats from one plugin instance to avoid duplicate logs
-            let should_sync_stats = plugin_name.contains("domestic") || plugin_name == "cache";
-            
+            let should_sync_stats = plugin_name_task.contains("domestic") || plugin_name_task == "cache";
+
             // Deduplication: Track recently processed qhashes (qhash -> last_processed_epoch)
             let refresh_dedup: std::sync::Arc<DashMap<u64, u64>> = std::sync::Arc::new(DashMap::new());
-            
+
             loop {
-                interval.tick().await;
-                stats_interval_counter += 1;
-                
-                // Try to acquire lock (non-blocking)
-                if let Ok(mut guard) = filter_clone.try_lock() {
-                    // Poll Shadow Refresh events from Ring Buffer
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = interval.tick() => {
+                        stats_interval_counter += 1;
+
+                        // Try to acquire lock (non-blocking)
+                        if let Ok(mut guard) = filter_clone.try_lock() {
                     // Poll Shadow Refresh events from Ring Buffer
                     let dedup = refresh_dedup.clone();
                     let refresh_count = guard.poll_refresh_events(|qhash| {
@@ -669,31 +724,30 @@ impl CachePlugin {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        
+
                         if let Some(last) = dedup.get(&qhash) {
                             if now_epoch < *last + 5 {
                                 return; // Skip, already processed recently
                             }
                         }
                         dedup.insert(qhash, now_epoch);
-                        
+
                         // Cleanup old entries (keep map small)
                         if dedup.len() > 1000 {
                             dedup.retain(|_, v| now_epoch < *v + 60);
                         }
-                        
+
                         // Look up domain info from reverse mapping
                         if let Some((domain, qtype, qclass)) = xdp_hash_map.get(&qhash) {
                             debug!("🔄 Shadow Refresh event: {} (type={})", domain, qtype);
-                            
+
                             // Trigger background refresh
                             if let Some(ref recursive) = prefetch_recursive {
                                 let recursive_clone = recursive.clone();
                                 let cache_for_refresh = cache_clone.clone();
                                 let filter_for_refresh = filter_clone.clone();
-                                
                                 let domain_clone = domain.clone();
-                                
+
                                 tokio::spawn(async move {
                                     match recursive_clone.lookup(&domain_clone, qtype).await {
                                         Ok(response) => {
@@ -702,16 +756,19 @@ impl CachePlugin {
                                                 .map(|r: &hickory_proto::rr::Record| r.ttl())
                                                 .min()
                                                 .unwrap_or(300);
-                                            
+
                                             let response_bytes = match response.to_vec() {
                                                 Ok(b) => b,
                                                 Err(e) => {
-                                                    warn!("❌ Shadow Refresh encode failed for {}: {}", domain_clone, e);
+                                                    warn!(
+                                                        "❌ Shadow Refresh encode failed for {}: {}",
+                                                        domain_clone, e
+                                                    );
                                                     return;
                                                 }
                                             };
                                             let raw_bytes = bytes::Bytes::from(response_bytes);
-                                            
+
                                             let qname_raw = if let Some(query) = response.queries().first() {
                                                 let mut qname_raw = Vec::new();
                                                 let mut encoder = BinEncoder::new(&mut qname_raw);
@@ -723,7 +780,7 @@ impl CachePlugin {
                                             } else {
                                                 None
                                             };
-                                            
+
                                             // Update Moka cache
                                             let mut hasher = SimdDomainHasher::new();
                                             let name_hash = hasher.hash_domain(&domain_clone);
@@ -733,15 +790,31 @@ impl CachePlugin {
                                                 qclass,
                                                 subnet: None,
                                             };
-                                            let entry = CachedEntry::new_with_bytes(response, ttl as u64, raw_bytes.clone());
+                                            let entry = CachedEntry::new_with_bytes(
+                                                response,
+                                                ttl as u64,
+                                                raw_bytes.clone(),
+                                            );
                                             cache_for_refresh.insert(key, entry).await;
-                                            
+
                                             // Update XDP cache
                                             if xdp_enabled {
                                                 if let Some(qname_raw) = qname_raw {
                                                     let mut guard = filter_for_refresh.lock().await;
-                                                    if guard.update_cache(&qname_raw, qtype, qclass, raw_bytes.as_ref(), ttl as u64).is_ok() {
-                                                        debug!("✅ Shadow Refresh updated: {} (TTL: {}s)", domain_clone, ttl);
+                                                    if guard
+                                                        .update_cache(
+                                                            &qname_raw,
+                                                            qtype,
+                                                            qclass,
+                                                            raw_bytes.as_ref(),
+                                                            ttl as u64,
+                                                        )
+                                                        .is_ok()
+                                                    {
+                                                        debug!(
+                                                            "✅ Shadow Refresh updated: {} (TTL: {}s)",
+                                                            domain_clone, ttl
+                                                        );
                                                     }
                                                 }
                                             }
@@ -754,11 +827,11 @@ impl CachePlugin {
                             }
                         }
                     });
-                    
+
                     if refresh_count > 0 {
                         debug!("🔄 Processed {} Shadow Refresh events", refresh_count);
                     }
-                    
+
                     // Update stats every tick (1 second) for real-time frontend
                     // But only log every 3 ticks (3 seconds) to avoid spam
                     // Only sync from one plugin instance to prevent race/duplicate
@@ -766,9 +839,12 @@ impl CachePlugin {
                         match guard.get_cache_stats() {
                             Ok(s) => {
                                 crate::stats::STATS.set_xdp_hits(s.cache_hits);
-                                
+
                                 if stats_interval_counter >= 3 {
-                                    info!("📊 XDP Stats Sync: Hits={}, Misses={}, Shadows={}", s.cache_hits, s.cache_misses, s.shadow_refreshes);
+                                    info!(
+                                        "📊 XDP Stats Sync: Hits={}, Misses={}, Shadows={}",
+                                        s.cache_hits, s.cache_misses, s.shadow_refreshes
+                                    );
                                     stats_interval_counter = 0;
                                 }
                             }
@@ -780,11 +856,17 @@ impl CachePlugin {
                             }
                         }
                     } else if stats_interval_counter >= 3 {
-                         stats_interval_counter = 0;
+                        stats_interval_counter = 0;
+                    }
+                }
                     }
                 }
             }
         });
+
+        if !started {
+            warn!("XDP refresh task not started for: {}", plugin_name);
+        }
 
         // Trigger XDP Cache Warmup (Cold Start Optimization)
         // This syncs already-loaded cache entries to the kernel
@@ -792,7 +874,7 @@ impl CachePlugin {
             let cache_clone = self.cache.clone();
             let filter_for_warmup = filter.clone();
             let xdp_hash_map = self.xdp_hash_map.clone();
-            
+
             tokio::spawn(async move {
                 Self::warm_xdp_cache_async(cache_clone, filter_for_warmup, xdp_hash_map).await;
             });
@@ -1303,6 +1385,8 @@ impl Clone for CachePlugin {
             xdp_filter: self.xdp_filter.clone(),
             xdp_cache_enabled: self.xdp_cache_enabled,
             xdp_hash_map: self.xdp_hash_map.clone(),
+            #[cfg(target_os = "linux")]
+            xdp_refresh_task_mgr: None,
         }
     }
 }

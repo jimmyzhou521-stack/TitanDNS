@@ -11,8 +11,7 @@ use axum::{
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::RwLock;
-use std::collections::HashMap;
+use dashmap::DashMap;
 
 /// Global metrics collector
 pub struct MetricsCollector {
@@ -34,10 +33,10 @@ pub struct MetricsCollector {
     pub parse_errors: AtomicU64,
     
     // Upstream health metrics
-    pub upstream_metrics: Arc<RwLock<HashMap<String, UpstreamMetrics>>>,
+    pub upstream_metrics: DashMap<String, UpstreamMetrics>,
     
     // Per-plugin metrics
-    pub plugin_metrics: Arc<RwLock<HashMap<String, PluginMetrics>>>,
+    pub plugin_metrics: DashMap<String, PluginMetrics>,
 }
 
 /// 上游服务器指标
@@ -80,8 +79,8 @@ impl MetricsCollector {
             upstream_errors: AtomicU64::new(0),
             timeout_errors: AtomicU64::new(0),
             parse_errors: AtomicU64::new(0),
-            upstream_metrics: Arc::new(RwLock::new(HashMap::new())),
-            plugin_metrics: Arc::new(RwLock::new(HashMap::new())),
+            upstream_metrics: DashMap::new(),
+            plugin_metrics: DashMap::new(),
         }
     }
 
@@ -127,8 +126,7 @@ impl MetricsCollector {
     }
 
     pub async fn record_upstream_query(&self, upstream_name: &str, latency_us: u64, success: bool) {
-        let mut metrics = self.upstream_metrics.write().await;
-        let entry = metrics.entry(upstream_name.to_string()).or_default();
+        let mut entry = self.upstream_metrics.entry(upstream_name.to_string()).or_default();
         entry.queries += 1;
         entry.total_latency_us += latency_us;
         if success {
@@ -139,15 +137,13 @@ impl MetricsCollector {
     }
 
     pub async fn record_plugin_execution(&self, plugin_name: &str, duration_us: u64, is_error: bool) {
-        let mut metrics = self.plugin_metrics.write().await;
-        let entry = metrics.entry(plugin_name.to_string()).or_default();
+        let mut entry = self.plugin_metrics.entry(plugin_name.to_string()).or_default();
         entry.executions += 1;
         entry.total_duration_us += duration_us;
         if is_error {
             entry.errors += 1;
         }
     }
-
     /// Generate Prometheus format metrics
     pub async fn to_prometheus_format(&self) -> String {
         let mut output = String::new();
@@ -215,13 +211,14 @@ impl MetricsCollector {
             self.parse_errors.load(Ordering::Relaxed)));
 
         // Plugin metrics
-        let plugin_metrics = self.plugin_metrics.read().await;
-        if !plugin_metrics.is_empty() {
+        if !self.plugin_metrics.is_empty() {
             output.push_str("# HELP titandns_plugin_executions_total Plugin execution count\n");
             output.push_str("# TYPE titandns_plugin_executions_total counter\n");
-            for (plugin_name, metrics) in plugin_metrics.iter() {
+            for entry in self.plugin_metrics.iter() {
+                let plugin_name = entry.key();
+                let metrics = entry.value();
                 output.push_str(&format!(
-                    "titandns_plugin_executions_total{{plugin=\"{}\"}} {}\n",
+                    "titandns_plugin_executions_total{plugin=\"{}\"} {}\n",
                     plugin_name, metrics.executions
                 ));
             }
@@ -229,9 +226,11 @@ impl MetricsCollector {
 
             output.push_str("# HELP titandns_plugin_errors_total Plugin error count\n");
             output.push_str("# TYPE titandns_plugin_errors_total counter\n");
-            for (plugin_name, metrics) in plugin_metrics.iter() {
+            for entry in self.plugin_metrics.iter() {
+                let plugin_name = entry.key();
+                let metrics = entry.value();
                 output.push_str(&format!(
-                    "titandns_plugin_errors_total{{plugin=\"{}\"}} {}\n",
+                    "titandns_plugin_errors_total{plugin=\"{}\"} {}\n",
                     plugin_name, metrics.errors
                 ));
             }
@@ -239,9 +238,11 @@ impl MetricsCollector {
 
             output.push_str("# HELP titandns_plugin_duration_microseconds_total Total plugin execution time\n");
             output.push_str("# TYPE titandns_plugin_duration_microseconds_total counter\n");
-            for (plugin_name, metrics) in plugin_metrics.iter() {
+            for entry in self.plugin_metrics.iter() {
+                let plugin_name = entry.key();
+                let metrics = entry.value();
                 output.push_str(&format!(
-                    "titandns_plugin_duration_microseconds_total{{plugin=\"{}\"}} {}\n",
+                    "titandns_plugin_duration_microseconds_total{plugin=\"{}\"} {}\n",
                     plugin_name, metrics.total_duration_us
                 ));
             }
@@ -250,8 +251,6 @@ impl MetricsCollector {
 
         output
     }
-}
-
 impl Default for MetricsCollector {
     fn default() -> Self {
         Self::new()

@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::borrow::Cow;
 use parking_lot::RwLock;
 
+use futures::stream::{self, StreamExt};
 use tracing::{debug, info, warn};
 use dashmap::DashMap;
 use chrono::Timelike;
@@ -139,10 +140,32 @@ pub fn set_weights_for_scope(scope: NetworkScope, config: WeightConfig) -> Resul
 
 /// Consecutive failures before marking unhealthy
 const FAILURE_THRESHOLD: u32 = 3;
+const FAILURE_THRESHOLD_LOOPBACK: u32 = 8;
 /// Cooldown period before retrying unhealthy upstream
 const RECOVERY_COOLDOWN: Duration = Duration::from_secs(30);
+const RECOVERY_COOLDOWN_LOOPBACK: Duration = Duration::from_secs(5);
 /// Probe interval for active health checks
 const PROBE_INTERVAL: Duration = Duration::from_secs(10);
+
+fn is_loopback_label(label: &str) -> bool {
+    label.contains("127.0.0.1") || label.contains("[::1]") || label.contains("localhost")
+}
+
+fn failure_threshold_for_label(label: &str) -> u32 {
+    if is_loopback_label(label) {
+        FAILURE_THRESHOLD_LOOPBACK
+    } else {
+        FAILURE_THRESHOLD
+    }
+}
+
+fn recovery_cooldown_for_label(label: &str) -> Duration {
+    if is_loopback_label(label) {
+        RECOVERY_COOLDOWN_LOOPBACK
+    } else {
+        RECOVERY_COOLDOWN
+    }
+}
 
 /// Global epoch for upstream score changes (ranking cache invalidation)
 static UPSTREAM_SCORE_EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -333,7 +356,8 @@ impl UpstreamMetrics {
             self.failure_count.fetch_add(1, Ordering::Relaxed);
             let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
             
-            if failures >= FAILURE_THRESHOLD as u64 {
+            let threshold = failure_threshold_for_label(&self.label) as u64;
+            if failures >= threshold {
                 if self.healthy.swap(false, Ordering::Relaxed) {
                     warn!("⚠️ Upstream '{}' marked UNHEALTHY (consecutive failures: {})", 
                           self.label, failures);
@@ -411,7 +435,8 @@ impl UpstreamMetrics {
         
         // Check if cooldown expired - allow retry
         if let Some(unhealthy_time) = *self.last_unhealthy.read() {
-            if unhealthy_time.elapsed() > RECOVERY_COOLDOWN {
+            let cooldown = recovery_cooldown_for_label(&self.label);
+            if unhealthy_time.elapsed() > cooldown {
                 debug!("🔄 Upstream '{}' cooldown expired, allowing retry", self.label);
                 return true;
             }
@@ -802,14 +827,18 @@ fn load_autopilot_snapshot(path: &PathBuf) -> Option<AutopilotSnapshot> {
     }
 }
 
-fn save_autopilot_snapshot(path: &PathBuf) -> Result<(), String> {
+async fn save_autopilot_snapshot(path: &PathBuf) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
     }
 
-    let snapshot = build_autopilot_snapshot();
-    let json = serde_json::to_string_pretty(&snapshot).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| e.to_string())?;
+    let json = tokio::task::spawn_blocking(|| -> Result<String, String> {
+        let snapshot = build_autopilot_snapshot();
+        serde_json::to_string_pretty(&snapshot).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    tokio::fs::write(path, json).await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -929,7 +958,7 @@ impl AutoPilot {
                 _ = shutdown.cancelled() => {
                     info!("?? AutoPilot Engine stopping...");
                     if let Some(ref path) = persist_path {
-                        if let Err(e) = save_autopilot_snapshot(path) {
+                        if let Err(e) = save_autopilot_snapshot(path).await {
                             warn!("?? AutoPilot: Failed to save snapshot on shutdown: {}", e);
                         }
                     }
@@ -959,7 +988,7 @@ impl AutoPilot {
 
                     if let Some(ref path) = persist_path {
                         if last_persist.elapsed() >= AUTOPILOT_PERSIST_INTERVAL {
-                            if let Err(e) = save_autopilot_snapshot(path) {
+                            if let Err(e) = save_autopilot_snapshot(path).await {
                                 warn!("?? AutoPilot: Failed to save snapshot: {}", e);
                             }
                             last_persist = Instant::now();
@@ -1050,47 +1079,50 @@ impl AutoPilot {
     /// Probe all registered upstreams
     async fn run_probes(&self) {
         let upstreams = self.upstreams.read().clone();
+        let timeout = self.probe_timeout;
+        let max_concurrency = std::cmp::max(1, std::cmp::min(upstreams.len(), 32));
 
-        for upstream in upstreams {
-            // Skip if recently probed (within 5 seconds)
-            if upstream.last_probe.read().elapsed() < Duration::from_secs(5) {
-                continue;
-            }
-
-            let probe_type = match Self::classify_probe_type(&upstream.label) {
-                Some(t) => t,
-                None => continue, // Skip DoH/aliapi/quic or unknown schemes
-            };
-
-            // Spawn probe task
-            let metrics = upstream.clone();
-            let timeout = self.probe_timeout;
-
-            tokio::spawn(async move {
-                let start = Instant::now();
-                let result = tokio::time::timeout(
-                    timeout,
-                    Self::probe_upstream(&metrics.label, probe_type)
-                ).await;
-
-                match result {
-                    Ok(Ok(())) => {
-                        let latency = start.elapsed().as_millis() as u64;
-                        metrics.record_probe(Some(latency), probe_type);
+        stream::iter(upstreams)
+            .for_each_concurrent(max_concurrency, |upstream| {
+                let timeout = timeout;
+                async move {
+                    // Skip if recently probed (within 5 seconds)
+                    if upstream.last_probe.read().elapsed() < Duration::from_secs(5) {
+                        return;
                     }
-                    Ok(Err(e)) => {
-                        debug!("? Probe failed for {}: {}", metrics.label, e);
-                        metrics.record_probe(None, probe_type);
-                    }
-                    Err(_) => {
-                        debug!("? Probe timeout for {}", metrics.label);
-                        metrics.record_probe(None, probe_type);
+
+                    let probe_type = match Self::classify_probe_type(&upstream.label) {
+                        Some(t) => t,
+                        None => return, // Skip DoH/aliapi/quic or unknown schemes
+                    };
+
+                    let metrics = upstream.clone();
+
+                    let start = Instant::now();
+                    let result = tokio::time::timeout(
+                        timeout,
+                        Self::probe_upstream(&metrics.label, probe_type)
+                    )
+                    .await;
+
+                    match result {
+                        Ok(Ok(())) => {
+                            let latency = start.elapsed().as_millis() as u64;
+                            metrics.record_probe(Some(latency), probe_type);
+                        }
+                        Ok(Err(e)) => {
+                            debug!("? Probe failed for {}: {}", metrics.label, e);
+                            metrics.record_probe(None, probe_type);
+                        }
+                        Err(_) => {
+                            debug!("? Probe timeout for {}", metrics.label);
+                            metrics.record_probe(None, probe_type);
+                        }
                     }
                 }
-            });
-        }
+            })
+            .await;
     }
-
     fn classify_probe_type(label: &str) -> Option<ProbeType> {
         let lower = label.to_lowercase();
         if lower.starts_with("udp://") {
@@ -3395,6 +3427,17 @@ pub fn get_ip_quality(ip: std::net::IpAddr) -> Option<IpQuality> {
     IP_QUALITY_CACHE.get(&ip).map(|e| e.clone())
 }
 
+/// 获取 IP 质量（仅返回新鲜数据，过期视为未知）
+pub fn get_ip_quality_fresh(ip: std::net::IpAddr) -> Option<IpQuality> {
+    IP_QUALITY_CACHE.get(&ip).and_then(|q| {
+        if q.needs_recheck() {
+            None
+        } else {
+            Some(q.clone())
+        }
+    })
+}
+
 /// 检查 IP 是否已知不可达
 pub fn is_ip_known_bad(ip: std::net::IpAddr) -> bool {
     if let Some(quality) = IP_QUALITY_CACHE.get(&ip) {
@@ -3452,9 +3495,15 @@ pub fn spawn_ip_verification(ips: Vec<std::net::IpAddr>, upstream: String) {
             }
             
             // 根据 IP 类型选择端口
-            let port = if ip.is_ipv4() { 80 } else { 80 }; // HTTP 端口
-            
-            match check_ip_reachability(ip, port).await {
+            let mut best_latency = None;
+            for port in [443u16, 80u16] {
+                if let Some(latency) = check_ip_reachability(ip, port).await {
+                    best_latency = Some(latency);
+                    break;
+                }
+            }
+
+            match best_latency {
                 Some(latency) => {
                     record_ip_quality(ip, true, Some(latency));
                     debug!("✅ IP 可达: {} ({}ms)", ip, latency);

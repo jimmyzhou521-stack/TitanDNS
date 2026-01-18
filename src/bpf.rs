@@ -279,14 +279,35 @@ pub fn start_refresh_listener_task<F>(
 where
     F: Fn(u64) + Send + Sync + 'static,
 {
+    start_refresh_listener_task_with_shutdown(
+        filter,
+        callback,
+        tokio_util::sync::CancellationToken::new(),
+    )
+}
+
+/// Start a standalone Shadow Refresh polling task with shutdown support.
+#[cfg(target_os = "linux")]
+pub fn start_refresh_listener_task_with_shutdown<F>(
+    filter: std::sync::Arc<tokio::sync::Mutex<DnsBpfFilter>>,
+    callback: F,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn(u64) + Send + Sync + 'static,
+{
     let callback = std::sync::Arc::new(callback);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
-            interval.tick().await;
-            if let Ok(mut guard) = filter.try_lock() {
-                let cb = callback.clone();
-                let _ = guard.poll_refresh_events(|qhash| (cb)(qhash));
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = interval.tick() => {
+                    if let Ok(mut guard) = filter.try_lock() {
+                        let cb = callback.clone();
+                        let _ = guard.poll_refresh_events(|qhash| (cb)(qhash));
+                    }
+                }
             }
         }
     })

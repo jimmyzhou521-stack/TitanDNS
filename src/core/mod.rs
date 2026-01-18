@@ -12,3 +12,4 @@ pub mod lockfree;
 pub mod health;  // 上游健康度追踪
 pub mod metrics; // Prometheus Metrics
 pub mod hot_reload; // [NEW] Ghost Reload Core
+pub mod task_manager; // Background task manager

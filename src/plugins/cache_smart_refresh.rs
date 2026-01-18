@@ -36,6 +36,7 @@ use tracing::{info, warn, debug};
 
 use crate::plugins::cache::CachePlugin;
 use crate::plugins::forward::ForwardPlugin;
+use crate::core::task_manager::TaskManager;
 use dashmap::DashMap;
 
 /// 智能刷新管理器
@@ -50,6 +51,8 @@ pub struct SmartRefreshManager {
     refreshing: Arc<DashMap<String, u64>>,
     /// 刷新统计（原子计数）
     stats: Arc<RefreshStatsAtomic>,
+    /// 后台任务管理器
+    task_mgr: Arc<TaskManager>,
 }
 
 /// 刷新策略配置
@@ -87,6 +90,7 @@ impl Clone for SmartRefreshManager {
             config: Arc::clone(&self.config),
             refreshing: Arc::clone(&self.refreshing),
             stats: Arc::clone(&self.stats),
+            task_mgr: Arc::clone(&self.task_mgr),
         }
     }
 }
@@ -105,6 +109,7 @@ impl SmartRefreshManager {
             config: Arc::new(RwLock::new(RefreshConfig::default())),
             refreshing: Arc::new(DashMap::new()),
             stats: Arc::new(RefreshStatsAtomic::default()),
+            task_mgr: Arc::new(TaskManager::new()),
         }
     }
 
@@ -160,34 +165,47 @@ impl SmartRefreshManager {
     /// 定期扫描缓存，对即将过期的条目进行刷新
     pub fn start_background_task(&self) {
         let manager = self.clone();
+        if !self.task_mgr.start(move |shutdown| {
+            async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(10)); // 每 10 秒检查一次
+                let mut check_counter = 0u32;
 
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10)); // 每 10 秒检查一次
-            let mut check_counter = 0u32;
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            break;
+                        }
+                        _ = interval.tick() => {
+                            check_counter += 1;
 
-            loop {
-                interval.tick().await;
-                check_counter += 1;
+                            // 根据配置的间隔执行刷新
+                            let config = manager.config.read().await;
+                            let should_check = check_counter >= (config.refresh_interval / 10) as u32;
 
-                // 根据配置的间隔执行刷新
-                let config = manager.config.read().await;
-                let should_check = check_counter >= (config.refresh_interval / 10) as u32;
+                            if should_check {
+                                check_counter = 0;
+                                drop(config); // 释放锁
 
-                if should_check {
-                    check_counter = 0;
-                    drop(config); // 释放锁
-
-                    info!("🔄 智能刷新：开始扫描缓存...");
-                    let stats = manager.scan_and_refresh().await;
-                    info!("🔄 智能刷新完成: 扫描={}, 刷新={}, 跳过={}",
-                          stats.scanned, stats.refreshed, stats.skipped);
+                                info!("🔄 智能刷新：开始扫描缓存...");
+                                let stats = manager.scan_and_refresh().await;
+                                info!("🔄 智能刷新完成: 扫描={}, 刷新={}, 跳过={}",
+                                      stats.scanned, stats.refreshed, stats.skipped);
+                            }
+                        }
+                    }
                 }
             }
-        });
+        }) {
+            return;
+        }
 
         info!("🚀 智能刷新后台任务已启动");
     }
 
+    /// 停止后台刷新任务
+    pub fn stop_background_task(&self) {
+        self.task_mgr.stop();
+    }
     /// 扫描缓存并刷新即将过期的条目
     async fn scan_and_refresh(&self) -> RefreshStats {
         let mut stats = RefreshStats::default();
@@ -450,3 +468,11 @@ mod tests {
         // 这里仅作为示例
     }
 }
+
+
+impl Drop for SmartRefreshManager {
+    fn drop(&mut self) {
+        self.task_mgr.stop();
+    }
+}
+

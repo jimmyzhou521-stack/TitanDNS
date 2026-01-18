@@ -173,12 +173,19 @@ async fn get_query_logs(axum::extract::Query(params): axum::extract::Query<LogPa
 
 /// GET /api/config
 async fn get_config(Extension(state): Extension<AppState>) -> impl IntoResponse {
-    match crate::config::Config::load_from_file(&state.config_file) {
-        Ok(c) => (no_cache_headers(), Json(c)).into_response(),
+    let path = state.config_file.clone();
+    match tokio::task::spawn_blocking(move || crate::config::Config::load_from_file(&path)).await {
+        Ok(Ok(c)) => (no_cache_headers(), Json(c)).into_response(),
+        Ok(Err(e)) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to load config: {}", e),
+        )
+            .into_response(),
         Err(e) => (
-             axum::http::StatusCode::INTERNAL_SERVER_ERROR, 
-             format!("Failed to load config: {}", e)
-        ).into_response()
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to load config (join error): {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -189,8 +196,21 @@ async fn update_config(
 ) -> impl IntoResponse {
     match serde_yaml::to_string(&new_config) {
         Ok(yaml) => {
-            if let Err(e) = std::fs::write(&state.config_file, yaml) {
-                 return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write config: {}", e)).into_response();
+            let path = state.config_file.clone();
+            let tmp_path = path.with_extension("tmp");
+            if let Err(e) = tokio::fs::write(&tmp_path, &yaml).await {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to write config: {}", e),
+                )
+                    .into_response();
+            }
+            if let Err(e) = tokio::fs::rename(&tmp_path, &path).await {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to replace config: {}", e),
+                )
+                    .into_response();
             }
             (axum::http::StatusCode::OK, Json(json!({"status": "ok", "message": "Config updated, hot reload triggered"}))).into_response()
         },

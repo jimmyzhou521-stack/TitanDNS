@@ -7,14 +7,17 @@ use crate::core::metrics;
 use crate::core::singleflight::Singleflight;
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
-use hickory_proto::op::{Message, ResponseCode};
+use hickory_proto::op::{Message, ResponseCode, Edns};
 use hickory_proto::rr::{RData, RecordType};
+use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
+use tokio::task::AbortHandle;
 use tracing::{debug, warn};
 
 const DEFAULT_DOH_POOL_IDLE_TIMEOUT_SECS: u64 = 300;
@@ -1533,6 +1536,12 @@ impl ForwardPlugin {
         )
     }
 
+    fn abort_all(aborts: &[AbortHandle]) {
+        for handle in aborts {
+            handle.abort();
+        }
+    }
+
     /// [Level 2] 基于查询预测触发预热
     fn trigger_prefetch(&self, domain: &str) {
         // 获取预测的下一个查询
@@ -1569,6 +1578,7 @@ impl ForwardPlugin {
     /// Race 策略：并发查询所有上游，返回第一个成功结果
     async fn execute_race(&self, req_bytes: &Bytes) -> Result<Message> {
         let mut futures = FuturesUnordered::new();
+        let mut aborts: Vec<AbortHandle> = Vec::new();
 
         for upstream in self.upstreams.iter().take(self.upstreams.len().min(3)) {
             if let Upstream::Doh {
@@ -1587,34 +1597,47 @@ impl ForwardPlugin {
             let rb = req_bytes.clone();
             let timeout = u.effective_timeout(self.timeout);
 
-            futures.push(tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let start = std::time::Instant::now();
                 let label = u.get_label();
                 let result = tokio::time::timeout(timeout, u.exchange_bytes(&rb)).await;
                 (label, result, start.elapsed())
-            }));
+            });
+            aborts.push(handle.abort_handle());
+            futures.push(handle);
         }
 
         let mut best_definitive: Option<Message> = None;
         let mut best_other: Option<Message> = None;
 
         while let Some(res) = futures.next().await {
-            if let Ok((label, Ok(Ok(msg)), elapsed)) = res {
-                crate::autopilot::record_success(&label, elapsed.as_millis() as u64);
-                debug!("🚀 Race success from {} ({}ms)", label, elapsed.as_millis());
+            match res {
+                Ok((label, Ok(Ok(msg)), elapsed)) => {
+                    debug!(
+                        "🚀 Race success from {} ({}ms)",
+                        label,
+                        elapsed.as_millis()
+                    );
 
-                if Self::response_has_ip(&msg) {
-                    return Ok(msg);
-                }
-                if Self::response_is_definitive(&msg) {
-                    if best_definitive.is_none() {
-                        best_definitive = Some(msg);
+                    if Self::response_has_ip(&msg) {
+                        Self::abort_all(&aborts);
+                        return Ok(msg);
                     }
-                } else if best_other.is_none() {
-                    best_other = Some(msg);
+                    if Self::response_is_definitive(&msg) {
+                        if best_definitive.is_none() {
+                            best_definitive = Some(msg);
+                        }
+                    } else if best_other.is_none() {
+                        best_other = Some(msg);
+                    }
                 }
-            } else if let Ok((label, _, _)) = res {
-                crate::autopilot::record_failure(&label);
+                Ok((label, Ok(Err(_)), _)) => {
+                    debug!("🚀 Race upstream failed: {}", label);
+                }
+                Ok((label, Err(_), _)) => {
+                    crate::autopilot::record_failure(&label);
+                }
+                Err(_) => {}
             }
         }
 
@@ -1669,6 +1692,7 @@ impl ForwardPlugin {
         if strategy == "race" {
             // 赛马模式：并发查询，返回第一个成功结果
             let mut futures = FuturesUnordered::new();
+            let mut aborts: Vec<AbortHandle> = Vec::new();
 
             for upstream in self.upstreams.iter().take(self.upstreams.len().min(5)) {
                 // 从 3 增加到 5，提高命中快速上游的概率
@@ -1688,40 +1712,47 @@ impl ForwardPlugin {
                 let rb = req_bytes.clone();
                 let timeout = u.effective_timeout(self.timeout);
 
-                futures.push(tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     let start = std::time::Instant::now();
                     let label = u.get_label();
                     let result = tokio::time::timeout(timeout, u.exchange_bytes(&rb)).await;
                     (label, result, start.elapsed())
-                }));
+                });
+                aborts.push(handle.abort_handle());
+                futures.push(handle);
             }
 
             let mut best_definitive: Option<Message> = None;
             let mut best_other: Option<Message> = None;
 
             while let Some(res) = futures.next().await {
-                if let Ok((label, Ok(Ok(msg)), elapsed)) = res {
-                    // Track success in AutoPilot
-                    crate::autopilot::record_success(&label, elapsed.as_millis() as u64);
-                    debug!(
-                        "🚀 Race success from {} ({}ms), ID: {}",
-                        label,
-                        elapsed.as_millis(),
-                        msg.header().id()
-                    );
-                    if Self::response_has_ip(&msg) {
-                        return Ok(msg);
-                    }
-                    if Self::response_is_definitive(&msg) {
-                        if best_definitive.is_none() {
-                            best_definitive = Some(msg);
+                match res {
+                    Ok((label, Ok(Ok(msg)), elapsed)) => {
+                        debug!(
+                            "🚀 Race success from {} ({}ms), ID: {}",
+                            label,
+                            elapsed.as_millis(),
+                            msg.header().id()
+                        );
+                        if Self::response_has_ip(&msg) {
+                            Self::abort_all(&aborts);
+                            return Ok(msg);
                         }
-                    } else if best_other.is_none() {
-                        best_other = Some(msg);
+                        if Self::response_is_definitive(&msg) {
+                            if best_definitive.is_none() {
+                                best_definitive = Some(msg);
+                            }
+                        } else if best_other.is_none() {
+                            best_other = Some(msg);
+                        }
                     }
-                } else if let Ok((label, _, _)) = res {
-                    // Track failure in AutoPilot
-                    crate::autopilot::record_failure(&label);
+                    Ok((label, Ok(Err(_)), _)) => {
+                        debug!("🚀 Race upstream failed: {}", label);
+                    }
+                    Ok((label, Err(_), _)) => {
+                        crate::autopilot::record_failure(&label);
+                    }
+                    Err(_) => {}
                 }
             }
 
@@ -1737,21 +1768,12 @@ impl ForwardPlugin {
             // Order 模式：顺序查询
             for upstream in &self.upstreams {
                 let label = upstream.get_label();
-                let start = std::time::Instant::now();
 
                 let timeout = upstream.effective_timeout(self.timeout);
-                match tokio::time::timeout(timeout, upstream.exchange_bytes(&req_bytes)).await
-                {
-                    Ok(Ok(resp)) => {
-                        // Track success in AutoPilot
-                        crate::autopilot::record_success(
-                            &label,
-                            start.elapsed().as_millis() as u64,
-                        );
-                        return Ok(resp);
-                    }
-                    _ => {
-                        // Track failure in AutoPilot
+                match tokio::time::timeout(timeout, upstream.exchange_bytes(&req_bytes)).await {
+                    Ok(Ok(resp)) => return Ok(resp),
+                    Ok(Err(_)) => continue,
+                    Err(_) => {
                         crate::autopilot::record_failure(&label);
                         continue;
                     }
@@ -1763,7 +1785,6 @@ impl ForwardPlugin {
 
     /// [Level 15] 注入 EDNS Client Subnet (ECS) 到 DNS 请求
     /// 这让上游 DNS 服务器能够返回地理位置优化的结果
-    /// TODO: 完善 OPT record 构造 (hickory_proto API 研究中)
     fn inject_ecs(req: &Message, client_ip: std::net::IpAddr) -> Message {
         // 获取 ECS 配置
         let ecs_ip = match crate::autopilot::get_ecs_client_ip(client_ip) {
@@ -1773,16 +1794,31 @@ impl ForwardPlugin {
 
         let prefix_len = crate::autopilot::get_ecs_prefix_length(ecs_ip);
 
-        // 构建 ECS 选项数据 (已准备好，待 OPT 注入)
-        let _ecs_data = crate::autopilot::build_ecs_option(ecs_ip, prefix_len);
+        let mut msg = req.clone();
+        let edns = msg.extensions_mut().get_or_insert_with(Edns::new);
 
-        // TODO: hickory_proto OPT 构造 API 需要进一步研究
-        // 目前先记录日志，不实际注入
-        debug!("⚡ ECS 准备就绪 (待注入): {} /{}", ecs_ip, prefix_len);
+        if edns.option(EdnsCode::Subnet).is_some() {
+            edns.set_max_payload(1232);
+            edns.set_version(0);
+            return msg;
+        }
 
-        req.clone()
+        let options = edns.options_mut();
+
+        let (mask, scope) = match ecs_ip {
+            std::net::IpAddr::V4(_) => (prefix_len, 0),
+            std::net::IpAddr::V6(_) => (prefix_len, 0),
+        };
+
+        let subnet = ClientSubnet::new(ecs_ip, mask, scope);
+        options.insert(EdnsOption::Subnet(subnet));
+
+        // Ensure EDNS payload/version are sane
+        edns.set_max_payload(1232);
+        edns.set_version(0);
+
+        msg
     }
-
     /// [Level 19] 后台验证 DNS 响应中的 IP 可达性
     fn spawn_response_ip_verification(resp: &Message, upstream: String) {
         use hickory_proto::rr::RData;
@@ -1884,12 +1920,10 @@ impl ForwardPlugin {
                     let timeout = upstream.effective_timeout(self.timeout);
 
                     // 尝试使用历史最优上游
-                    match tokio::time::timeout(timeout, upstream.exchange_bytes(&req_bytes))
-                        .await
+                    match tokio::time::timeout(timeout, upstream.exchange_bytes(&req_bytes)).await
                     {
                         Ok(Ok(resp)) => {
                             let elapsed = start.elapsed().as_millis() as u64;
-                            crate::autopilot::record_success(&label, elapsed);
                             // [Level 13] 更新客户端感知域名记忆
                             if let Some(ip) = client_ip {
                                 if let Some(d_lower) = domain_lower_ref {
@@ -1923,11 +1957,17 @@ impl ForwardPlugin {
                             );
                             return Ok(resp);
                         }
-                        _ => {
-                            // 快速通道失败，继续正常流程
-                            crate::autopilot::record_failure(&label);
+                        Ok(Err(_)) => {
                             debug!(
                                 "⚠️ AI快速通道失败: {} ({}), 切换常规流程",
+                                domain_str, label
+                            );
+                        }
+                        Err(_) => {
+                            // 快速通道超时，继续正常流程
+                            crate::autopilot::record_failure(&label);
+                            debug!(
+                                "⚠️ AI快速通道超时: {} ({}), 切换常规流程",
                                 domain_str, label
                             );
                         }
@@ -2100,7 +2140,6 @@ impl ForwardPlugin {
             match tokio::time::timeout(timeout, upstream.exchange_bytes(&req_bytes)).await {
                 Ok(Ok(resp)) => {
                     let elapsed = start.elapsed().as_millis() as u64;
-                    crate::autopilot::record_success(&label, elapsed);
                     // [AI学习] 记录域名最佳上游 (客户端感知)
                     if let Some(ref d) = domain {
                         if let Some(ip) = client_ip {
@@ -2129,7 +2168,8 @@ impl ForwardPlugin {
                     debug!("🤖 Smart: {} responded in {}ms", label, elapsed);
                     return Ok(resp);
                 }
-                _ => {
+                Ok(Err(_)) => return Err(anyhow::anyhow!("Single upstream failed")),
+                Err(_) => {
                     crate::autopilot::record_failure(&label);
                     return Err(anyhow::anyhow!("Single upstream failed"));
                 }
@@ -2146,52 +2186,22 @@ impl ForwardPlugin {
 
         // Spawn primary request
         let primary_start = std::time::Instant::now();
-        let primary_handle = tokio::spawn(async move {
+        let mut primary_handle = tokio::spawn(async move {
             let result =
                 tokio::time::timeout(primary_timeout, primary.exchange_bytes(&req_clone)).await;
             (primary_label, result, primary_start.elapsed())
         });
+        let mut aborts: Vec<AbortHandle> = Vec::new();
+        aborts.push(primary_handle.abort_handle());
+        let mut primary_done = None;
+        let mut primary_completed = false;
 
         // Wait for hedge_delay or primary completion
         tokio::select! {
             // Primary completed within hedge delay
-            result = &mut Box::pin(async { primary_handle.await }) => {
-                match result {
-                    Ok((label, Ok(Ok(resp)), elapsed)) => {
-                        let elapsed_ms = elapsed.as_millis() as u64;
-                        crate::autopilot::record_success(&label, elapsed_ms);
-                        // [AI学习] 记录域名最佳上游 (客户端感知)
-                        if let Some(ref d) = domain {
-                            if let Some(ip) = client_ip {
-                                if let Some(d_lower) = domain_lower_ref {
-                                    crate::autopilot::record_domain_result_for_client_lower(d_lower, &label, elapsed_ms, ip);
-                                } else {
-                                    crate::autopilot::record_domain_result_for_client(d, &label, elapsed_ms, ip);
-                                }
-                            } else if let Some(d_lower) = domain_lower_ref {
-                                crate::autopilot::record_domain_result_lower(d_lower, &label, elapsed_ms);
-                            } else {
-                                crate::autopilot::record_domain_result(d, &label, elapsed_ms);
-                            }
-                        }
-                        debug!("🤖 Smart[Primary]: {} responded in {}ms (score: {})",
-                               elapsed_ms,
-                               label,
-                               crate::autopilot::AUTOPILOT.get(&label).map(|m| m.get_score()).unwrap_or(0));
-                        if Self::response_has_ip(&resp) || Self::response_is_definitive(&resp) {
-                            return Ok(resp);
-                        }
-                        if best_other.is_none() {
-                            best_other = Some(resp);
-                        }
-                    }
-                    Ok((label, _, _)) => {
-                        crate::autopilot::record_failure(&label);
-                        // Primary failed, try remaining upstreams
-                    }
-                    Err(_) => {
-                        // Join error, continue to backups
-                    }
+            result = &mut primary_handle => {
+                if let Ok(tuple) = result {
+                    primary_done = Some(tuple);
                 }
             }
 
@@ -2201,31 +2211,78 @@ impl ForwardPlugin {
             }
         }
 
+        if let Some((label, result, elapsed)) = primary_done {
+            primary_completed = true;
+            match result {
+                Ok(Ok(resp)) => {
+                    let elapsed_ms = elapsed.as_millis() as u64;
+                    // [AI学习] 记录域名最佳上游 (客户端感知)
+                    if let Some(ref d) = domain {
+                        if let Some(ip) = client_ip {
+                            if let Some(d_lower) = domain_lower_ref {
+                                crate::autopilot::record_domain_result_for_client_lower(d_lower, &label, elapsed_ms, ip);
+                            } else {
+                                crate::autopilot::record_domain_result_for_client(d, &label, elapsed_ms, ip);
+                            }
+                        } else if let Some(d_lower) = domain_lower_ref {
+                            crate::autopilot::record_domain_result_lower(d_lower, &label, elapsed_ms);
+                        } else {
+                            crate::autopilot::record_domain_result(d, &label, elapsed_ms);
+                        }
+                    }
+                    debug!(
+                        "🤖 Smart[Primary]: {} responded in {}ms (score: {})",
+                        elapsed_ms,
+                        label,
+                        crate::autopilot::AUTOPILOT
+                            .get(&label)
+                            .map(|m| m.get_score())
+                            .unwrap_or(0)
+                    );
+                    if Self::response_has_ip(&resp) || Self::response_is_definitive(&resp) {
+                        Self::abort_all(&aborts);
+                        return Ok(resp);
+                    }
+                    if best_other.is_none() {
+                        best_other = Some(resp);
+                    }
+                }
+                Ok(Err(_)) => {
+                    debug!("🤖 Smart[Primary]: {} failed", label);
+                }
+                Err(_) => {
+                    crate::autopilot::record_failure(&label);
+                }
+            }
+        }
+
         // Fire backup requests (hedged)
         let mut futures = FuturesUnordered::new();
+
+        if !primary_completed {
+            futures.push(primary_handle);
+        }
 
         for upstream in available.iter().skip(1) {
             let u = (*upstream).clone();
             let r = req_bytes.clone();
             let t = u.effective_timeout(self.timeout);
 
-            futures.push(tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let start = std::time::Instant::now();
                 let label = u.get_label();
                 let result = tokio::time::timeout(t, u.exchange_bytes(&r)).await;
                 (label, result, start.elapsed())
-            }));
+            });
+            aborts.push(handle.abort_handle());
+            futures.push(handle);
         }
-
-        // Also add the original primary handle back if it's still running
-        // (it might complete while we're processing backups)
 
         // Wait for any response
         while let Some(res) = futures.next().await {
             match res {
                 Ok((label, Ok(Ok(resp)), elapsed)) => {
                     let elapsed_ms = elapsed.as_millis() as u64;
-                    crate::autopilot::record_success(&label, elapsed_ms);
                     // [AI学习] 记录域名最佳上游
                     if let Some(ref d) = domain {
                         if let Some(ip) = client_ip {
@@ -2263,6 +2320,7 @@ impl ForwardPlugin {
                             .unwrap_or(0)
                     );
                     if Self::response_has_ip(&resp) {
+                        Self::abort_all(&aborts);
                         return Ok(resp);
                     }
                     if Self::response_is_definitive(&resp) {
@@ -2273,9 +2331,12 @@ impl ForwardPlugin {
                         best_other = Some(resp);
                     }
                 }
-                Ok((label, _, _)) => {
-                    crate::autopilot::record_failure(&label);
+                Ok((label, Ok(Err(_)), _)) => {
                     debug!("🤖 Smart[Hedge]: {} failed", label);
+                }
+                Ok((label, Err(_), _)) => {
+                    crate::autopilot::record_failure(&label);
+                    debug!("🤖 Smart[Hedge]: {} timeout", label);
                 }
                 Err(_) => {}
             }
@@ -2292,19 +2353,12 @@ impl ForwardPlugin {
         for upstream in &self.upstreams {
             let label = upstream.get_label();
             if !ranked.contains(&label) {
-                let start = std::time::Instant::now();
-
                 let timeout = upstream.effective_timeout(self.timeout);
                 match tokio::time::timeout(timeout, upstream.exchange_bytes(&req_bytes)).await
                 {
-                    Ok(Ok(resp)) => {
-                        crate::autopilot::record_success(
-                            &label,
-                            start.elapsed().as_millis() as u64,
-                        );
-                        return Ok(resp);
-                    }
-                    _ => {
+                    Ok(Ok(resp)) => return Ok(resp),
+                    Ok(Err(_)) => continue,
+                    Err(_) => {
                         crate::autopilot::record_failure(&label);
                         continue;
                     }
@@ -2323,28 +2377,33 @@ impl ForwardPlugin {
         req_bytes: &Bytes,
     ) -> Result<Message> {
         let mut futures = FuturesUnordered::new();
+        let mut aborts: Vec<AbortHandle> = Vec::new();
 
         let req_clone1 = req_bytes.clone();
         let u1_clone = u1.clone();
         let timeout1 = u1_clone.effective_timeout(self.timeout);
-        futures.push(tokio::spawn(async move {
+        let handle1 = tokio::spawn(async move {
             let start = std::time::Instant::now();
             let label = u1_clone.get_label();
             let result =
                 tokio::time::timeout(timeout1, u1_clone.exchange_bytes(&req_clone1)).await;
             (label, result, start.elapsed())
-        }));
+        });
+        aborts.push(handle1.abort_handle());
+        futures.push(handle1);
 
         let req_clone2 = req_bytes.clone();
         let u2_clone = u2.clone();
         let timeout2 = u2_clone.effective_timeout(self.timeout);
-        futures.push(tokio::spawn(async move {
+        let handle2 = tokio::spawn(async move {
             let start = std::time::Instant::now();
             let label = u2_clone.get_label();
             let result =
                 tokio::time::timeout(timeout2, u2_clone.exchange_bytes(&req_clone2)).await;
             (label, result, start.elapsed())
-        }));
+        });
+        aborts.push(handle2.abort_handle());
+        futures.push(handle2);
 
         let mut best_definitive: Option<Message> = None;
         let mut best_other: Option<Message> = None;
@@ -2352,13 +2411,13 @@ impl ForwardPlugin {
         while let Some(res) = futures.next().await {
             match res {
                 Ok((label, Ok(Ok(resp)), elapsed)) => {
-                    crate::autopilot::record_success(&label, elapsed.as_millis() as u64);
                     debug!(
                         "🤖 Dual-Race: {} responded in {}ms",
                         label,
                         elapsed.as_millis()
                     );
                     if Self::response_has_ip(&resp) {
+                        Self::abort_all(&aborts);
                         return Ok(resp);
                     }
                     if Self::response_is_definitive(&resp) {
@@ -2369,9 +2428,12 @@ impl ForwardPlugin {
                         best_other = Some(resp);
                     }
                 }
-                Ok((label, _, _)) => {
-                    crate::autopilot::record_failure(&label);
+                Ok((label, Ok(Err(_)), _)) => {
                     debug!("🤖 Dual-Race: {} failed", label);
+                }
+                Ok((label, Err(_), _)) => {
+                    crate::autopilot::record_failure(&label);
+                    debug!("🤖 Dual-Race: {} timeout", label);
                 }
                 Err(_) => {}
             }
@@ -2400,6 +2462,7 @@ impl ForwardPlugin {
         use futures::StreamExt;
 
         let mut futures = FuturesUnordered::new();
+        let mut aborts: Vec<AbortHandle> = Vec::new();
         let domain_lower = domain
             .as_deref()
             .map(crate::autopilot::normalize_domain_lower);
@@ -2411,12 +2474,14 @@ impl ForwardPlugin {
             let r = req_bytes.clone();
             let t = u.effective_timeout(self.timeout);
 
-            futures.push(tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let start = std::time::Instant::now();
                 let label = u.get_label();
                 let result = tokio::time::timeout(t, u.exchange_bytes(&r)).await;
                 (label, result, start.elapsed())
-            }));
+            });
+            aborts.push(handle.abort_handle());
+            futures.push(handle);
         }
 
         // 等待第一个成功响应
@@ -2428,7 +2493,6 @@ impl ForwardPlugin {
             match res {
                 Ok((label, Ok(Ok(resp)), elapsed)) => {
                     let elapsed_ms = elapsed.as_millis() as u64;
-                    crate::autopilot::record_success(&label, elapsed_ms);
 
                     // 记录域名学习 (客户端感知)
                     if let Some(ref d) = domain {
@@ -2466,6 +2530,7 @@ impl ForwardPlugin {
                         attempts
                     );
                     if Self::response_has_ip(&resp) {
+                        Self::abort_all(&aborts);
                         return Ok(resp);
                     }
                     if Self::response_is_definitive(&resp) {
@@ -2476,9 +2541,12 @@ impl ForwardPlugin {
                         best_other = Some(resp);
                     }
                 }
-                Ok((label, _, _)) => {
-                    crate::autopilot::record_failure(&label);
+                Ok((label, Ok(Err(_)), _)) => {
                     debug!("❌ Graduated-Race: {} 失败", label);
+                }
+                Ok((label, Err(_), _)) => {
+                    crate::autopilot::record_failure(&label);
+                    debug!("❌ Graduated-Race: {} 超时", label);
                 }
                 Err(_) => {}
             }
@@ -2501,6 +2569,114 @@ impl ForwardPlugin {
             upstreams.len()
         ))
     }
+}
+
+fn should_limit_best_ips(ctx: &Context) -> bool {
+    if ctx.has_tag("proxy") {
+        return false;
+    }
+    ctx.has_tag("cn")
+        || ctx.has_tag("direct")
+        || ctx.has_tag("ip_cn")
+        || ctx.has_tag("ip_cn_accurate")
+}
+
+fn filter_best_ips(resp: &mut Message, limit: bool) {
+    if !limit {
+        return;
+    }
+
+    const KEEP_KNOWN_PER_FAMILY: usize = 2;
+    const KEEP_UNKNOWN_FALLBACK_PER_FAMILY: usize = 1;
+
+    let mut v4_known: Vec<(IpAddr, u64)> = Vec::new();
+    let mut v6_known: Vec<(IpAddr, u64)> = Vec::new();
+    let mut v4_unknown: Vec<IpAddr> = Vec::new();
+    let mut v6_unknown: Vec<IpAddr> = Vec::new();
+
+    for record in resp.answers() {
+        match record.data() {
+            RData::A(ip) => {
+                let ip = IpAddr::V4(**ip);
+                if crate::autopilot::is_ip_known_bad(ip) {
+                    continue;
+                }
+                if let Some(q) = crate::autopilot::get_ip_quality_fresh(ip) {
+                    if q.reachable {
+                        v4_known.push((ip, q.tcp_latency_ms.unwrap_or(u64::MAX / 2)));
+                    }
+                } else {
+                    v4_unknown.push(ip);
+                }
+            }
+            RData::AAAA(ip) => {
+                let ip = IpAddr::V6(**ip);
+                if crate::autopilot::is_ip_known_bad(ip) {
+                    continue;
+                }
+                if let Some(q) = crate::autopilot::get_ip_quality_fresh(ip) {
+                    if q.reachable {
+                        v6_known.push((ip, q.tcp_latency_ms.unwrap_or(u64::MAX / 2)));
+                    }
+                } else {
+                    v6_unknown.push(ip);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if v4_known.is_empty() && v6_known.is_empty() {
+        return;
+    }
+
+    let mut keep: HashSet<IpAddr> = HashSet::new();
+    let mut keep_all_v4 = false;
+    let mut keep_all_v6 = false;
+
+    if !v4_known.is_empty() {
+        v4_known.sort_by_key(|(_, latency)| *latency);
+        for (ip, _) in v4_known.iter().take(KEEP_KNOWN_PER_FAMILY) {
+            keep.insert(*ip);
+        }
+        if !v4_unknown.is_empty() && KEEP_UNKNOWN_FALLBACK_PER_FAMILY > 0 {
+            for ip in v4_unknown.iter().take(KEEP_UNKNOWN_FALLBACK_PER_FAMILY) {
+                keep.insert(*ip);
+            }
+        }
+    } else if !v4_unknown.is_empty() {
+        keep_all_v4 = true;
+    }
+
+    if !v6_known.is_empty() {
+        v6_known.sort_by_key(|(_, latency)| *latency);
+        for (ip, _) in v6_known.iter().take(KEEP_KNOWN_PER_FAMILY) {
+            keep.insert(*ip);
+        }
+        if !v6_unknown.is_empty() && KEEP_UNKNOWN_FALLBACK_PER_FAMILY > 0 {
+            for ip in v6_unknown.iter().take(KEEP_UNKNOWN_FALLBACK_PER_FAMILY) {
+                keep.insert(*ip);
+            }
+        }
+    } else if !v6_unknown.is_empty() {
+        keep_all_v6 = true;
+    }
+
+    if keep.is_empty() && !keep_all_v4 && !keep_all_v6 {
+        return;
+    }
+
+    resp.answers_mut().retain(|record| match record.data() {
+        RData::A(ip) => {
+            let ip = IpAddr::V4(**ip);
+            keep_all_v4 || keep.contains(&ip)
+        }
+        RData::AAAA(ip) => {
+            let ip = IpAddr::V6(**ip);
+            keep_all_v6 || keep.contains(&ip)
+        }
+        _ => true,
+    });
 }
 
 impl Plugin for ForwardPlugin {
@@ -2568,6 +2744,8 @@ impl Plugin for ForwardPlugin {
     // [Level 5.2] Smart TTL: 学习稳定性并动态调整 TTL
     async fn on_response(&self, ctx: &mut Context) -> Result<()> {
         let domain = ctx.qname_ref().to_string();
+        let limit_best_ips = should_limit_best_ips(ctx);
+
         if let Some(ref mut resp) = ctx.response {
             let rcode = resp.response_code();
 
@@ -2616,6 +2794,9 @@ impl Plugin for ForwardPlugin {
                         }
                     }
                 }
+
+                // 仅对国内/直连流量进行最优 IP 收敛
+                filter_best_ips(resp, limit_best_ips);
             }
         }
         Ok(())

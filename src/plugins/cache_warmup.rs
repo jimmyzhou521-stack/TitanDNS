@@ -31,7 +31,9 @@
 
 use anyhow::Result;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use futures::stream::{self, StreamExt};
 use tokio::time::timeout;
 use tracing::{info, warn, debug};
 
@@ -115,56 +117,47 @@ impl CacheWarmer {
         info!("📋 加载了 {} 个域名配置", total);
 
         let mut stats = WarmupStats::default();
+        let success = Arc::new(AtomicUsize::new(0));
+        let failure = Arc::new(AtomicUsize::new(0));
+        let timeout_duration = Duration::from_secs(self.warmup_timeout);
+        let concurrency = self.concurrency.max(1);
 
-        // 使用信号量控制并发
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.concurrency));
-        let mut tasks = Vec::new();
+        stream::iter(domains.into_iter())
+            .for_each_concurrent(concurrency, |domain_config| {
+                let cache = Arc::clone(&self.cache);
+                let forwarder = self.forwarder.clone();
+                let timeout_duration = timeout_duration;
+                let success = Arc::clone(&success);
+                let failure = Arc::clone(&failure);
 
-        for domain_config in domains {
-            let permit = semaphore.clone();
-            let cache = Arc::clone(&self.cache);
-            let forwarder = self.forwarder.clone();
-            let timeout_duration = Duration::from_secs(self.warmup_timeout);
+                async move {
+                    let result = timeout(timeout_duration, async {
+                        Self::warm_domain(cache, forwarder, domain_config).await
+                    })
+                    .await;
 
-            let task = tokio::spawn(async move {
-                // 获取许可（控制并发）
-                let _permit = permit.acquire().await.unwrap();
-
-                // 超时控制
-                let result = timeout(timeout_duration, async {
-                    Self::warm_domain(cache, forwarder, domain_config).await
-                }).await;
-
-                match result {
-                    Ok(Ok(dom)) => Ok(dom),
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err(anyhow::anyhow!("Warmup timeout")),
+                    match result {
+                        Ok(Ok(domain)) => {
+                            success.fetch_add(1, Ordering::Relaxed);
+                            debug!("✅ 预热成功: {}", domain);
+                        }
+                        Ok(Err(e)) => {
+                            failure.fetch_add(1, Ordering::Relaxed);
+                            debug!("❌ 预热失败: {}", e);
+                        }
+                        Err(_) => {
+                            failure.fetch_add(1, Ordering::Relaxed);
+                            debug!("❌ 预热超时");
+                        }
+                    }
                 }
-            });
+            })
+            .await;
 
-            tasks.push(task);
-        }
-
-        // 等待所有任务完成
-        for task in tasks {
-            match task.await {
-                Ok(Ok(domain)) => {
-                    stats.success_count += 1;
-                    debug!("✅ 预热成功: {}", domain);
-                }
-                Ok(Err(e)) => {
-                    stats.failure_count += 1;
-                    debug!("❌ 预热失败: {}", e);
-                }
-                Err(e) => {
-                    stats.failure_count += 1;
-                    warn!("❌ 预热任务出错: {}", e);
-                }
-            }
-        }
+        stats.success_count = success.load(Ordering::Relaxed);
+        stats.failure_count = failure.load(Ordering::Relaxed);
 
         info!("🔥 缓存预热完成: 成功 {}/{}，失败 {}", stats.success_count, total, stats.failure_count);
-
         Ok(stats)
     }
 
