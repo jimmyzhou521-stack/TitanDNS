@@ -167,9 +167,6 @@ plugins:
       - addr: "udp://180.76.76.76:53"
         so_mark: 255
         query_timeout_ms: 200
-      - addr: "udp://192.168.1.1:53"
-        so_mark: 255
-        query_timeout_ms: 200
       - addr: "udp://140.207.198.6:53"    # [整合] 联通
         so_mark: 255
         query_timeout_ms: 200
