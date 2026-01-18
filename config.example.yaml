@@ -314,6 +314,7 @@ plugins:
     target: "proxy"
     files:
       - "/etc/titandns/geosite.dat:gfw"
+      - "/etc/titandns/geosite.dat:github"
       - "/etc/titandns/geosite.dat:google"
       - "/etc/titandns/geosite.dat:google-gemini"
       - "/etc/titandns/geosite.dat:youtube"
