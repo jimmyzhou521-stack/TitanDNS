@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.3] - 2026-01-18
+
+### Changed
+
+- ⚡ SmartForward 改用 `local_upstreams` + `race` 模式（解决首包卡顿）
+- ⚡ 优化 UDP 超时：`udp_reply_timeout_ms: 100`
+- ⚡ 禁用首包重试：`udp_retries: 0`
+- ⚡ 增加本地并发数：`local_concurrent: 3`
+- 📝 更新 `config.example.yaml` 生产级配置
+- 🔒 脱敏处理：移除内网 IP 和敏感凭证
+
 ## [1.0.2] - 2026-01-18
 
 ### Added

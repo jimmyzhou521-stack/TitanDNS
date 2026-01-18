@@ -263,8 +263,8 @@ Use the included script to automatically update GeoSite, GeoIP, and AdBlock rule
 Create and push a git tag to trigger a GitHub Release:
 
 ```bash
-git tag v1.0.2
-git push origin v1.0.2
+git tag v1.0.3
+git push origin v1.0.3
 ```
 
 Pre-built binaries will be available in the Releases page.

@@ -44,6 +44,6 @@
   <!-- Version Badge -->
   <rect x="315" y="35" width="55" height="22" rx="4" fill="#e3f2fd"/>
   <text x="342" y="51" font-family="'Segoe UI', Arial, sans-serif" font-size="12" font-weight="600" fill="#1565c0" text-anchor="middle">
-    v1.0.2
+    v1.0.3
   </text>
 </svg>

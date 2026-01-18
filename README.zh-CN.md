@@ -263,8 +263,8 @@ TitanDNS 内置 Web 仪表盘，用于监控和管理。
 创建并推送 git 标签以触发 GitHub Release：
 
 ```bash
-git tag v1.0.2
-git push origin v1.0.2
+git tag v1.0.3
+git push origin v1.0.3
 ```
 
 预编译二进制文件将在 Releases 页面提供。

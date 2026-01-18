@@ -1,6 +1,6 @@
 [package]
 name = "titandns"
-version = "0.0.2"
+version = "1.0.3"
 edition = "2021"
 authors = ["TitanDNS Team"]
 description = "A next-generation, high-performance DNS forwarder powered by Rust and eBPF"
