@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="www/logo.svg" alt="TitanDNS Logo" width="120" height="120">
+  <img src="www/logo.svg" alt="TitanDNS Logo" width="280">
 </p>
 
 <h1 align="center">TitanDNS</h1>
