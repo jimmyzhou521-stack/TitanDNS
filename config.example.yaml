@@ -1,104 +1,99 @@
-# ============================================================================
-# TitanDNS V1.0.2 Ultimate Edition - 生产级示例配置
-# ============================================================================
-# 
-# 🚀 功能特性:
-#   - 智能分流: 自动识别国内/国外域名，国内直连、国外走代理
-#   - FakeIP 模式: 配合 sing-box 实现透明代理
-#   - 双缓存架构: 国内/国外缓存严格分离，防止污染
-#   - 高性能: XDP 内核加速，支持 500万+ QPS
-#   - 全协议: UDP/TCP/DoH/DoT/DoQ/SOCKS5
-#   - AliAPI: 阿里云 HTTPDNS 低延迟解析
-#
-# 📖 使用说明:
-#   1. 复制此文件到 /etc/titandns/config.yaml
-#   2. 根据实际环境修改配置（特别是网卡名称、sing-box 端口）
-#   3. 运行 systemctl start titandns
-#
-# ⚠️  需要修改的配置项已用 ⚠️ 标记
-#
-# ============================================================================
+# TitanDNS V8.9.1 Ultimate Edition - Full Featured & Performance Optimized
+# 包含全功能模块: DoH/DoT/DoQ/SOCKS5, DNSSEC, DNS64, AliAPI
+# 默认策略: 智能分流 + FakeIP 模式 (最佳性能)
+# 特性: IpMatcher 高精度国内 IP 列表匹配 + 阿里云 HTTPDNS API 支持
+# 优化: 前置 GeoSite 标签 + 条件缓存查询 (消除规则延迟)
+# 修复: 缓存污染问题 - 国内/国外缓存严格分离
 
-# ==================== 全局设置 ====================
+# ==================== Global Settings ====================
 log:
   level: "info"
-  file: "/var/log/titandns/titandns.log"
+  file: "/var/log/titandns/titandns.log"  # 每日自动轮转
 
 query_log:
   enabled: true
-  max_size: 5000
-  recent_blocked_limit: 500
+  max_size: 5000        # 内存中保存的完整查询记录数
+  recent_blocked_limit: 500 # 实时拦截日志条数 (建议 100-1000)
 
 singbox:
   auto_discover: true
-  socks_port: 10000             # ⚠️ 与 sing-box socks 入站端口一致
+  socks_port: 10000
   deadlock_domains: ["github.com", "raw.githubusercontent.com"]
 
+# Dashboard & API Server
 api:
-  http: "0.0.0.0:8080"
+  http: "0.0.0.0:8080"  # Dashboard 访问地址
 
 ebpf:
-  interface: "eth0"             # ⚠️ 改成你的实际网卡名称
+  interface: "ens18" 
   bpf_path: "/etc/titandns/titan_dns_filter.o"
   blacklist: []
+  # XDP Cache (Kernel-level acceleration - 500万+ QPS)
   xdp_cache:
-    enabled: true
-    max_entries: 100000
-    sync_hot_queries: true
+    enabled: true          # 启用 XDP Cache (需要 Linux 5.x+ 内核)
+    max_entries: 100000    # 最大缓存条目数 (LRU 自动淘汰)
+    sync_hot_queries: true # 自动同步热点查询到内核
 
-# ==================== 插件定义 ====================
+# ==================== Plugin Definitions ====================
 plugins:
-  # --- 广告拦截 ---
+  # --- 0. AdBlock ---
+  # 支持 AdGuard 语法规则 (||example.com^, @@whitelist)
   adblock_main:
     type: "adblock"
     files:
-      - "/etc/titandns/rules/adguard.txt"
+      - "/etc/titandns/rules/adguard.txt"  # 由 update_rules.sh 自动同步
 
-  # --- DGA 恶意域名检测 ---
+  # --- 0.1 DGA Filter ---
+  # 识别随机生成的域名 (entropy > 4.5)
   dga_filter:
     type: "dga"
     entropy_threshold: 4.5
     min_len: 12
-    dry_run: true
+    dry_run: true  # 仅日志记录，不拦截
 
-  # --- 双缓存架构 ---
+  # --- 1. Caching (双缓存架构) ---
+  #  国内缓存 - 仅用于 sequence_local
   cache_domestic:
     type: "cache"
     size: 100000
-    fakeip_protection: false
-    recursive_mode: false
-    prefetch_if_ttl_less_than: 240
-    serve_stale_ttl: 120
-    strategy: "race"
-    timeout: 500
-    upstreams:
+    fakeip_protection: false  # 国内不需要 FakeIP 保护
+    recursive_mode: false     # 国内不用递归，直接用国内 DNS
+    prefetch_if_ttl_less_than: 240  # [整合] 保留您的更激进预取
+    serve_stale_ttl: 120             # [整合] 保留您的更长过期容忍
+    # ✅ [优化] 防止首次查询卡顿
+    strategy: "race"          # 预取并发策略
+    timeout: 500              # 预取超时 (ms)
+    upstreams:                # [自动刷新] 使用国内 DNS
       - addr: "udp://223.5.5.5:53"
         so_mark: 255
       - addr: "udp://119.29.29.29:53"
         so_mark: 255
       - addr: "udp://114.114.114.114:53"
         so_mark: 255
-    persist_file: "/dev/shm/titandns/domestic.db"
+    persist_file: "/dev/shm/titandns/domestic.db"  # tmpfs - 零硬盘写入
     persist_interval: 300
 
+  #  国外/代理缓存 - 仅用于 FakeIP/DoH 流量
   cache_proxy:
     type: "cache"
     size: 100000
-    fakeip_protection: true
-    recursive_mode: false
-    prefetch_if_ttl_less_than: 240
-    serve_stale_ttl: 120
-    timeout: 2000
-    upstreams:
-      - addr: "udp://127.0.0.1:6666"  # ⚠️ sing-box DNS 入站端口
-    persist_file: "/dev/shm/titandns/proxy.db"
+    fakeip_protection: true   # 防止 FakeIP 污染
+    recursive_mode: false     # 不用本地递归（无法穿墙）
+    prefetch_if_ttl_less_than: 240  # [整合] 保留您的更激进预取
+    serve_stale_ttl: 120             # [整合] 保留您的更长过期容忍
+    # ✅ [优化] 防止首次查询卡顿
+    timeout: 2000             # 预取超时 (ms)
+    upstreams:                # [自动刷新] DoH over SOCKS5
+      - addr: "udp://127.0.0.1:6666"  # FakeIP upstream
+    persist_file: "/dev/shm/titandns/proxy.db"     # tmpfs - 零硬盘写入
     persist_interval: 300
 
-  # --- 本地规则 ---
+  # --- 2. Local Rules ---
   hosts_custom:
     type: "hosts"
     file: "/etc/titandns/rules/hosts.txt"
 
+  # --- 3. Matchers (域名级) ---
   matcher_blocklist:
     type: "matcher"
     files:
@@ -119,7 +114,8 @@ plugins:
       - "/etc/titandns/rules/ai_proxy.txt"
     mark: "proxy"
 
-  # --- IP 匹配器 ---
+  # --- 3.1 IP Matcher (IP级) ---
+  # 基于 Clang.cn 高精度国内 IP 列表进行响应 IP 级别判定
   ip_matcher_cn:
     type: "ip_matcher"
     files:
@@ -129,37 +125,41 @@ plugins:
       - "/etc/titandns/rules/cn_ipv6_apnic.txt"
     mark: "ip_cn_accurate"
 
-  # --- 阿里云 HTTPDNS（可选）---
-  # 如需使用，取消注释并填入真实凭证
+  # --- 3.2 Aliyun HTTPDNS API (阿里云私有 DNS) ---
+  # 使用阿里云 HTTPDNS API 进行解析 (延迟 5-10ms)
+  # 需要阿里云账号凭证，按次计费约 ¥0.01/万次
   # 文档: https://help.aliyun.com/document_detail/432223.html
-  # aliapi_domestic:
-  #   type: "aliapi"
-  #   account_id: "YOUR_ACCOUNT_ID"
-  #   access_key_id: "YOUR_ACCESS_KEY_ID"
-  #   access_key_secret: "YOUR_ACCESS_KEY_SECRET"
-  #   timeout_ms: 800
+  aliapi_domestic:
+    type: "aliapi"
+    account_id: "YOUR_ACCOUNT_ID"           # 替换为您的阿里云账号 ID
+    access_key_id: "YOUR_ACCESS_KEY_ID"     # 替换为您的 Access Key ID
+    access_key_secret: "YOUR_ACCESS_KEY_SECRET"  # 替换为您的 Access Key Secret
+    timeout_ms: 800  # AliAPI 请求超时 (ms)
 
-  # --- 上游 DNS ---
+  # --- 4. Upstreams ---
+  
+  # [A] 国内直连 (UDP Race - 带 SO_MARK 绕过 TPROXY)
   ratelimit_global:
     type: "ratelimit"
-    max_queries: 3000
-    window_secs: 1
+    max_queries: 3000       # [优化] 提升阈值，防止高并发网页加载误杀
+    window_secs: 1          # 时间窗口大小（秒）
 
   upstream_local:
     type: "forward"
-    strategy: "race"
+    strategy: "race"   # [优化] 改为 race 模式，并发查询，消除 Smart 200ms 预判延迟
     concurrent: 2048
-    timeout: 300
-    udp_reply_timeout_ms: 100
-    udp_retries: 0
+    timeout: 300         # P99 80ms 目标：压低整体超时上限
+    udp_reply_timeout_ms: 100  # UDP 单次等待 (ms)
+    udp_retries: 0             # 国内首包优先，避免重复等待
     tcp_connect_timeout_ms: 200
     tcp_read_timeout_ms: 400
     upstreams:
+      # === 标准 UDP DNS（免费，延迟 10-20ms）===
       - addr: "udp://223.5.5.5:53"
         so_mark: 255
         query_timeout_ms: 200
       - addr: "udp://119.29.29.29:53"
-        so_mark: 255
+        so_mark: 255  # 绕过 nftables TPROXY
         query_timeout_ms: 200
       - addr: "udp://114.114.114.114:53"
         so_mark: 255
@@ -167,81 +167,101 @@ plugins:
       - addr: "udp://180.76.76.76:53"
         so_mark: 255
         query_timeout_ms: 200
-      - addr: "udp://140.207.198.6:53"
+      - addr: "udp://192.168.1.1:53"
         so_mark: 255
         query_timeout_ms: 200
-      - addr: "udp://211.136.112.50:53"
+      - addr: "udp://140.207.198.6:53"    # [整合] 联通
         so_mark: 255
         query_timeout_ms: 200
-      - addr: "udp://180.184.1.1:53"
+      - addr: "udp://211.136.112.50:53"   # [整合] 移动
         so_mark: 255
         query_timeout_ms: 200
-      - addr: "udp://218.30.118.6:53"
+      - addr: "udp://180.184.1.1:53"      # [整合] 字节
         so_mark: 255
         query_timeout_ms: 200
-      - addr: "udp://1.2.4.8:53"
+      - addr: "udp://218.30.118.6:53"     # [整合] 360
+        so_mark: 255
+        query_timeout_ms: 200
+      - addr: "udp://1.2.4.8:53"          # [整合] CNNIC
         so_mark: 255
         query_timeout_ms: 200
 
-  # AliAPI Fallback（需先配置 aliapi_domestic）
-  # fallback_local:
-  #   type: "fallback"
-  #   primary: "upstream_local"
-  #   secondary: "aliapi_domestic"
-  #   threshold: 50
-  #   always_standby: false
+  # AliAPI 优先，UDP 兜底
+  fallback_local:
+    type: "fallback"
+    primary: "upstream_local"
+    secondary: "aliapi_domestic"
+    threshold: 50
+    always_standby: false
 
+  # [B] FakeIP 转发 (Singbox 本地端口，无需 mark)
   upstream_fakeip:
     type: "forward"
     strategy: "order"
     concurrent: 2048
-    timeout: 300
-    udp_reply_timeout_ms: 60
-    udp_retries: 0
+    timeout: 300          # 本地回环更快，压低超时
+    udp_reply_timeout_ms: 60   # 本地回环更快
+    udp_retries: 0             # 本地不重试
     tcp_connect_timeout_ms: 150
     tcp_read_timeout_ms: 300
     upstreams:
-      - addr: "udp://127.0.0.1:6666"  # ⚠️ sing-box DNS 入站端口
+      - addr: "udp://127.0.0.1:6666"
         query_timeout_ms: 200
+      # 127.0.0.1 是本地回环，不会走 TPROXY
 
+  # [C] DoH 上游 (SOCKS5 代理) - 需要真实 IP 时启用
   upstream_doh:
     type: "forward"
-    strategy: "smart"
+    strategy: "smart"   # [整合] 保留您的 smart 策略
     concurrent: 256
     timeout: 5000
     upstreams:
       - addr: "https://cloudflare-dns.com/dns-query"
-        socks5: "127.0.0.1:10000"    # ⚠️ sing-box SOCKS5 端口
+        socks5: "127.0.0.1:10000"
         query_timeout_ms: 800
       - addr: "https://dns.google/dns-query"
         socks5: "127.0.0.1:10000"
         query_timeout_ms: 800
-      - addr: "https://doh.dns.sb/dns-query"
+      - addr: "https://doh.dns.sb/dns-query"           # [整合] 保留您的额外上游
         socks5: "127.0.0.1:10000"
         query_timeout_ms: 800
-      - addr: "https://dns.adguard-dns.com/dns-query"
+      - addr: "https://dns.adguard-dns.com/dns-query"  # [整合] 保留您的额外上游
         socks5: "127.0.0.1:10000"
         query_timeout_ms: 800
 
+  # [D] DoQ 上游 - 实验性，暂不启用
   upstream_doq:
     type: "forward"
     strategy: "race"
     concurrent: 256
-    doq_idle_timeout: 120
-    doq_socks5_timeout: 3
+    doq_idle_timeout: 120        # 秒
+    doq_socks5_timeout: 3        # 秒 (仅 SOCKS5 DoQ 生效)
     upstreams:
       - addr: "quic://dns.adguard-dns.com:853"
         socks5: "127.0.0.1:10000"
 
-  # --- 智能分流 ---
+  # [E] DoT 上游 (TFO 优化) - 直连环境使用
+  # upstream_dot:
+  #   type: "forward"
+  #   strategy: "race"
+  #   concurrent: 1024
+  #   upstreams:
+  #     - addr: "tls://8.8.8.8:853"
+  #       dial_addr: "8.8.8.8"
+  #       tfo: true
+  #     - addr: "tls://1.1.1.1:853"
+  #       dial_addr: "1.1.1.1"
+  #       tfo: true
+
+  # --- 5. Advanced Routing ---
   smart_splitter:
     type: "smart_forward"
     geoip: "geoip_cn"
     ip_matcher: "ip_matcher_cn"
-    local_timeout_ms: 250
-    fakeip_timeout_ms: 700
-    udp_reply_timeout_ms: 120
-    udp_retries: 1
+    local_timeout_ms: 150
+    fakeip_timeout_ms: 500
+    udp_reply_timeout_ms: 80
+    udp_retries: 0
     tcp_connect_timeout_ms: 200
     tcp_read_timeout_ms: 400
     learning_cache_max_entries: 50000
@@ -252,69 +272,91 @@ plugins:
     domestic_suffixes:
       - ".cn"
       - ".cn."
-    local:
-      addr: "udp://223.5.5.5:53"
-      so_mark: 255
+    local_strategy: "race"
+    local_concurrent: 3
+    local_upstreams:
+      - addr: "udp://223.5.5.5:53"
+        so_mark: 255
+      - addr: "udp://119.29.29.29:53"
+        so_mark: 255
+      - addr: "udp://114.114.114.114:53"
+        so_mark: 255
     fakeip:
       addr: "udp://127.0.0.1:6666"
 
-  # --- ECS ---
+  # --- 6. ECS (Subnet) ---
   ecs_cn:
     type: "ecs"
     auto: true
-    # force_subnet: "YOUR_SUBNET/24"  # 可选：强制使用指定子网
+    force_subnet: "YOUR_SUBNET/24"
     ipv4_netmask: 24
     ipv6_netmask: 56
 
-  # --- GeoSite 规则 ---
+  # --- 7. GeoSite ---
+  # [优化] 完整国内主流站点规则 - 覆盖社交/购物/视频/游戏/银行等
   geosite_cn:
     type: "geosite"
     target: "cn"
     files:
+      # === 基础国内规则 ===
       - "/etc/titandns/geosite.dat:cn"
-      - "/etc/titandns/geosite.dat:tencent"
-      - "/etc/titandns/geosite.dat:alibaba"
-      - "/etc/titandns/geosite.dat:baidu"
-      - "/etc/titandns/geosite.dat:bytedance"
-      - "/etc/titandns/geosite.dat:bilibili"
-      - "/etc/titandns/geosite.dat:netease"
-      - "/etc/titandns/geosite.dat:jd"
-      - "/etc/titandns/geosite.dat:xiaomi"
-      - "/etc/titandns/geosite.dat:huawei"
-      - "/etc/titandns/geosite.dat:360"
-      - "/etc/titandns/geosite.dat:sina"
-      - "/etc/titandns/geosite.dat:zhihu"
-      - "/etc/titandns/geosite.dat:douban"
-      - "/etc/titandns/geosite.dat:iqiyi"
-      - "/etc/titandns/geosite.dat:youku"
-      - "/etc/titandns/geosite.dat:mgtv"
-      - "/etc/titandns/geosite.dat:douyu"
-      - "/etc/titandns/geosite.dat:huya"
-      - "/etc/titandns/geosite.dat:kugou"
-      - "/etc/titandns/geosite.dat:kuwo"
-      - "/etc/titandns/geosite.dat:pinduoduo"
-      - "/etc/titandns/geosite.dat:meituan"
-      - "/etc/titandns/geosite.dat:didi"
-      - "/etc/titandns/geosite.dat:eleme"
-      - "/etc/titandns/geosite.dat:steam"
-      - "/etc/titandns/geosite.dat:mihoyo"
-      - "/etc/titandns/geosite.dat:apple"
-      - "/etc/titandns/geosite.dat:apple-cn"
-      - "/etc/titandns/geosite.dat:microsoft"
-      - "/etc/titandns/geosite.dat:microsoft-cn"
-      - "/etc/titandns/geosite.dat:amazon-cn"
-      - "/etc/titandns/geosite.dat:bank"
-      - "/etc/titandns/geosite.dat:cmcc"
-      - "/etc/titandns/geosite.dat:chinatelecom"
-      - "/etc/titandns/geosite.dat:chinaunicom"
+      
+      # === 科技巨头 ===
+      - "/etc/titandns/geosite.dat:tencent"       # 腾讯 (QQ/微信/腾讯云/腾讯视频)
+      - "/etc/titandns/geosite.dat:alibaba"       # 阿里巴巴 (淘宝/天猫/支付宝/阿里云)
+      - "/etc/titandns/geosite.dat:baidu"         # 百度 (搜索/网盘/贴吧/百度云)
+      - "/etc/titandns/geosite.dat:bytedance"     # 字节跳动 (抖音/今日头条/西瓜视频)
+      - "/etc/titandns/geosite.dat:bilibili"      # 哔哩哔哩
+      - "/etc/titandns/geosite.dat:netease"       # 网易 (163邮箱/云音乐/游戏)
+      - "/etc/titandns/geosite.dat:jd"            # 京东
+      - "/etc/titandns/geosite.dat:xiaomi"        # 小米
+      - "/etc/titandns/geosite.dat:huawei"        # 华为
+      - "/etc/titandns/geosite.dat:360"           # 360
+      - "/etc/titandns/geosite.dat:sina"          # 新浪 (微博)
+      - "/etc/titandns/geosite.dat:zhihu"         # 知乎
+      - "/etc/titandns/geosite.dat:douban"        # 豆瓣
+      
+      # === 视频/直播/音乐 ===
+      - "/etc/titandns/geosite.dat:iqiyi"         # 爱奇艺
+      - "/etc/titandns/geosite.dat:youku"         # 优酷
+      - "/etc/titandns/geosite.dat:mgtv"          # 芒果TV
+      - "/etc/titandns/geosite.dat:douyu"         # 斗鱼直播
+      - "/etc/titandns/geosite.dat:huya"          # 虎牙直播
+      - "/etc/titandns/geosite.dat:kugou"         # 酷狗音乐
+      - "/etc/titandns/geosite.dat:kuwo"          # 酷我音乐
+      
+      # === 电商/外卖/出行 ===
+      - "/etc/titandns/geosite.dat:pinduoduo"     # 拼多多
+      - "/etc/titandns/geosite.dat:meituan"       # 美团
+      - "/etc/titandns/geosite.dat:didi"          # 滴滴
+      - "/etc/titandns/geosite.dat:eleme"         # 饿了么
+      
+      # === 游戏 ===
+      - "/etc/titandns/geosite.dat:steam"         # Steam (国区)
+      - "/etc/titandns/geosite.dat:mihoyo"        # 米哈游 (原神/崩坏)
+      
+      # === 国际公司中国区 ===
+      - "/etc/titandns/geosite.dat:apple"         # Apple 中国
+      - "/etc/titandns/geosite.dat:apple-cn"      # Apple 中国 (额外)
+      - "/etc/titandns/geosite.dat:microsoft"     # Microsoft 中国
+      - "/etc/titandns/geosite.dat:microsoft-cn"  # Microsoft 中国 (额外)
+      - "/etc/titandns/geosite.dat:amazon-cn"     # 亚马逊中国
+      
+      # === 金融/银行 (重要! 绝对不能走代理) ===
+      - "/etc/titandns/geosite.dat:bank"          # 银行域名合集
+      
+      # === 其他常用 ===
+      - "/etc/titandns/geosite.dat:cmcc"          # 中国移动
+      - "/etc/titandns/geosite.dat:chinatelecom"  # 中国电信
+      - "/etc/titandns/geosite.dat:chinaunicom"   # 中国联通
     mark: "cn"
 
+  # [优化] 增加 facebook/openai 规则
   geosite_proxy:
     type: "geosite"
     target: "proxy"
     files:
       - "/etc/titandns/geosite.dat:gfw"
-      - "/etc/titandns/geosite.dat:github"
       - "/etc/titandns/geosite.dat:google"
       - "/etc/titandns/geosite.dat:google-gemini"
       - "/etc/titandns/geosite.dat:youtube"
@@ -325,6 +367,7 @@ plugins:
       - "/etc/titandns/geosite.dat:openai"
     mark: "proxy"
 
+  # --- 8. GeoIP ---
   geoip_cn:
     type: "geoip"
     file: "/etc/titandns/geoip.mmdb"
@@ -332,45 +375,96 @@ plugins:
     tag: "ip_cn"
     mode: "response"
 
+  # --- 9. Handlers ---
   reject_nxdomain:
     type: "reject"
     rcode: "nxdomain"
 
+  # --- 10. Security & IPv6 ---
   dnssec:
     type: "dnssec"
     mode: "permissive"
 
+  # --- 11. IPv6 Filter ---
   ipv6_filter:
     type: "ipv6_filter"
-    mode: "prefer_ipv4"
-    delay_aaaa_ms: 0
+    mode: "prefer_ipv4"   # prefer_ipv4 | prefer_ipv6 | disable_ipv6 | disabled
+    delay_aaaa_ms: 0    # [优化] 从 50 调整回 10ms，避免首屏加载等待 IPv6 判定
 
-# ==================== 执行流程 ====================
+  # dns64:
+  #   type: "dns64"
+  #   prefix: "64:ff9b::/96"
+  #   only_if_no_aaaa: true
+
+# ==================== Execution Flow ====================
 sequences:
+  #  主流程 - 性能优化版 (逻辑修正)
   sequence_main:
+    # ========== 第零阶段: QPS 限流 (最早拦截) ==========
     - exec: ratelimit_global
+    
+    # ========== 第一阶段: 快速预处理 ==========
+    # 0. IPv6 优先级控制 (在最开始执行)
     - exec: ipv6_filter
+
+    # 1. 拦截非法请求 (PTR & HTTPS Type 65)
     - matches: [{ qtype: [12, 65] }]
       exec: reject_nxdomain
+
+    # ========== 第二阶段: 本地覆盖 (最高优先级 - 移至此处) ==========
+    # [修正] Hosts 放在广告拦截之前，确保白名单/自定义解析生效
     - exec: hosts_custom
+    
+    # AdBlock 优先拦截 (AdGuard 语法)
     - exec: adblock_main
+
+    # 黑名单拦截
     - matches: [{ match_plugin: matcher_blocklist }]
       exec: reject_nxdomain
+    
+    # ========== 第三阶段: 快速打标签 (不跳转) ==========
+    # 先执行 GeoSite 为域名打标签
     - exec: geosite_cn
     - exec: geosite_proxy
+    
+    # 静态规则补充标签
     - exec: matcher_whitelist
     - exec: matcher_greylist
+
+    # ========== 第四阶段: 条件缓存查询 (核心优化) ==========
+    # 根据标签条件跳转到对应子序列查询缓存
     - matches: [{ has_tag: "cn" }]
       exec: sequence_local
+    
     - matches: [{ has_tag: "direct" }]
       exec: sequence_local
+    
     - matches: [{ has_tag: "proxy" }]
       exec: sequence_proxy
+
+    # ========== 第五阶段: 未知域名处理 ==========
+    # ECS 注入 (仅用于未知域名探测)
     - exec: ecs_cn
+    
+    # DGA 检测 (仅检查未知域名，减少常规查询开销)
     - exec: dga_filter
+    
+    # 智能兜底分流 (GeoIP 判定)
+    # Smart Splitter 内部会:
+    # 1. 探测国内 DNS 获取真实 IP
+    # 2. 用 GeoIP 判断是否国内
+    # 3. 如果国内 → 返回真实 IP
+    # 4. 如果国外 → 查询 FakeIP 上游 → 返回 FakeIP
+    # 5. 结果存入 learning_cache (自动学习)
+    # 注意: smart_splitter 内部直接设置响应并 return，后续步骤不会执行
     - exec: smart_splitter
+    
+    # ========== 第六阶段: 后置安全检查 ==========
+    # 注意: 如果走了 smart_splitter，这里不会执行
+    # 但如果未来有其他分支到达这里，dnssec 会生效
     - exec: dnssec
 
+  #  强制刷新/调试序列 (No Cache)
   sequence_requery:
     - exec: ipv6_filter
     - matches: [{ qtype: [12, 65] }]
@@ -384,9 +478,9 @@ sequences:
     - exec: matcher_whitelist
     - exec: matcher_greylist
     - matches: [{ has_tag: "cn" }]
-      exec: upstream_local
+      exec: fallback_local
     - matches: [{ has_tag: "direct" }]
-      exec: upstream_local
+      exec: fallback_local
     - matches: [{ has_tag: "proxy" }]
       exec: upstream_fakeip
     - exec: ecs_cn
@@ -394,26 +488,49 @@ sequences:
     - exec: smart_splitter
     - exec: dnssec
 
+  #  代理节点专用序列
   sequence_node:
     - exec: cache_proxy
     - exec: upstream_fakeip
 
+  #  国内直连序列
   sequence_local:
-    - exec: cache_domestic
-    - exec: upstream_local
-    # 如启用 AliAPI，改为: - exec: fallback_local
+    - exec: cache_domestic  # ✅ 仅在此处查询国内缓存
+    - exec: fallback_local
 
+  #  国外代理序列
   sequence_proxy:
-    - exec: cache_proxy
+    - exec: cache_proxy     # ✅ 仅在此处查询国外缓存
     - exec: upstream_fakeip
 
+  #  DoH 测试序列
   sequence_doq:
     - exec: upstream_doq
     - exec: dnssec
 
-# ==================== 服务监听 ====================
+# ==================== Server Listeners ====================
 servers:
-  # 主 DNS (53)
+  # [8888] 本地直连专用
+  - protocol: udp
+    addr: "0.0.0.0:8888"
+    entry: sequence_local
+    socket_opts:
+      so_reuseport: true
+      so_rcvbuf: 8388608
+      so_sndbuf: 8388608
+      workers: 0
+      tcp_read_timeout_ms: 5000         # 仅 TCP/DoT 生效
+      doh_keep_alive_interval_ms: 15000 # 仅 DoH 生效
+      doh_keep_alive_timeout_ms: 20000  # 仅 DoH 生效
+
+  - protocol: tcp
+    addr: "0.0.0.0:8888"
+    entry: sequence_local
+    socket_opts:
+      so_reuseport: true
+      tcp_read_timeout_ms: 5000
+
+  # [53] 主 DNS 服务 (Batch IO Enabled)
   - protocol: udp
     addr: "0.0.0.0:53"
     entry: sequence_main
@@ -423,6 +540,9 @@ servers:
       so_rcvbuf: 16777216
       so_sndbuf: 16777216
       workers: 0
+      tcp_read_timeout_ms: 5000         # 仅 TCP/DoT 生效
+      doh_keep_alive_interval_ms: 15000 # 仅 DoH 生效
+      doh_keep_alive_timeout_ms: 20000  # 仅 DoH 生效
 
   - protocol: tcp
     addr: "0.0.0.0:53"
@@ -431,13 +551,16 @@ servers:
       so_reuseport: true
       tcp_read_timeout_ms: 5000
 
-  # 调试端口 (6667)
+  # [6667] 强制刷新/调试端口 (No Cache) - 借鉴 MosDNS
   - protocol: udp
     addr: "0.0.0.0:6667"
     entry: sequence_requery
     socket_opts:
       so_reuseport: true
       workers: 0
+      tcp_read_timeout_ms: 5000         # 仅 TCP/DoT 生效
+      doh_keep_alive_interval_ms: 15000 # 仅 DoH 生效
+      doh_keep_alive_timeout_ms: 20000  # 仅 DoH 生效
 
   - protocol: tcp
     addr: "0.0.0.0:6667"
@@ -446,7 +569,7 @@ servers:
       so_reuseport: true
       tcp_read_timeout_ms: 5000
 
-  # 节点专用 (7777)
+  # [7777] 节点专用端口
   - protocol: udp
     addr: "0.0.0.0:7777"
     entry: sequence_node
@@ -455,6 +578,9 @@ servers:
       so_rcvbuf: 8388608
       so_sndbuf: 8388608
       workers: 0
+      tcp_read_timeout_ms: 5000         # 仅 TCP/DoT 生效
+      doh_keep_alive_interval_ms: 15000 # 仅 DoH 生效
+      doh_keep_alive_timeout_ms: 20000  # 仅 DoH 生效
 
   - protocol: tcp
     addr: "0.0.0.0:7777"
@@ -463,30 +589,16 @@ servers:
       so_reuseport: true
       tcp_read_timeout_ms: 5000
 
-  # 国内直连 (8888)
-  - protocol: udp
-    addr: "0.0.0.0:8888"
-    entry: sequence_local
-    socket_opts:
-      so_reuseport: true
-      so_rcvbuf: 8388608
-      so_sndbuf: 8388608
-      workers: 0
-
-  - protocol: tcp
-    addr: "0.0.0.0:8888"
-    entry: sequence_local
-    socket_opts:
-      so_reuseport: true
-      tcp_read_timeout_ms: 5000
-
-  # DoQ 测试 (8530)
+  # [8530] 测试端口 (走 DoH + 代理)
   - protocol: udp
     addr: "0.0.0.0:8530"
     entry: sequence_doq
     socket_opts:
       so_reuseport: true
       workers: 0
+      tcp_read_timeout_ms: 5000         # 仅 TCP/DoT 生效
+      doh_keep_alive_interval_ms: 15000 # 仅 DoH 生效
+      doh_keep_alive_timeout_ms: 20000  # 仅 DoH 生效
 
   - protocol: tcp
     addr: "0.0.0.0:8530"
