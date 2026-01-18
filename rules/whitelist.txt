@@ -107,3 +107,10 @@ keyword:aaplimg
 keyword:akadns
 keyword:akamai
 keyword:qtlcdn
+domain:weixin.com
+domain:wx.qq.com
+domain:mp.weixin.qq.com
+domain:open.weixin.qq.com
+domain:wechatpay.com
+keyword:weixin
+keyword:wechat
