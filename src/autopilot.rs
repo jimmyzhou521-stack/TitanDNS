@@ -179,6 +179,24 @@ const PREFETCH_QPS_LIMIT: u64 = 300;          // current QPS guard
 const PREFETCH_AVG_QPS_30S_LIMIT: f64 = 200.0; // avg QPS guard
 const PREFETCH_COOLDOWN: Duration = Duration::from_secs(120);
 const AUTOPILOT_WEIGHT_TUNE_INTERVAL: Duration = Duration::from_secs(300); // 5 min
+const BACKGROUND_QPS_LIMIT: u64 = 800;
+const BACKGROUND_AVG_QPS_30S_LIMIT: f64 = 500.0;
+const BACKGROUND_JITTER_MAX_MS: u64 = 3000;
+const PREFETCH_JITTER_MAX_MS: u64 = 15000;
+
+pub fn should_skip_background_task() -> bool {
+    let current = get_current_qps();
+    let avg = get_avg_qps(30);
+    current > BACKGROUND_QPS_LIMIT || avg > BACKGROUND_AVG_QPS_30S_LIMIT
+}
+
+pub fn background_jitter_delay(max_ms: u64) -> Duration {
+    if max_ms == 0 {
+        return Duration::from_millis(0);
+    }
+    let jitter = rand::thread_rng().gen_range(0..=max_ms);
+    Duration::from_millis(jitter)
+}
 
 pub(crate) fn normalize_domain_lower<'a>(domain: &'a str) -> Cow<'a, str> {
     let d = domain.trim_end_matches('.');
@@ -988,10 +1006,18 @@ impl AutoPilot {
 
                     if let Some(ref path) = persist_path {
                         if last_persist.elapsed() >= AUTOPILOT_PERSIST_INTERVAL {
-                            if let Err(e) = save_autopilot_snapshot(path).await {
-                                warn!("?? AutoPilot: Failed to save snapshot: {}", e);
-                            }
                             last_persist = Instant::now();
+                            if should_skip_background_task() {
+                                debug!("?? AutoPilot: Snapshot skipped due to high QPS");
+                            } else {
+                                let path = path.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(background_jitter_delay(BACKGROUND_JITTER_MAX_MS)).await;
+                                    if let Err(e) = save_autopilot_snapshot(&path).await {
+                                        warn!("?? AutoPilot: Failed to save snapshot: {}", e);
+                                    }
+                                });
+                            }
                         }
                     }
                 }
@@ -3299,6 +3325,12 @@ where
         
         loop {
             interval.tick().await;
+
+            if should_skip_background_task() {
+                debug!("?? Predictive prefetch skipped due to high QPS");
+                continue;
+            }
+            tokio::time::sleep(background_jitter_delay(PREFETCH_JITTER_MAX_MS)).await;
             
             // 获取下一小时热门域名
             let candidates = get_prefetch_candidates(50);
@@ -4198,3 +4230,4 @@ pub fn get_contextual_bandit_stats() -> Vec<(DomainCategory, String, f64, f64)> 
         })
         .collect()
 }
+

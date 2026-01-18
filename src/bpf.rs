@@ -9,7 +9,7 @@ use aya::Bpf;
 #[cfg(target_os = "linux")]
 use aya::programs::{Xdp, XdpFlags};
 #[cfg(target_os = "linux")]
-use tracing::info;
+use tracing::{debug, info};
 #[cfg(target_os = "linux")]
 use std::path::Path;
 
@@ -141,7 +141,7 @@ impl DnsBpfFilter {
         if response.len() >= 4 { entry.rcode = (response[3] & 0x0F) as u16; }
 
         // Insert into kernel cache using the u64 rich hash
-        info!("XDP Sync: h={:x} len={} rcode={}", qhash, entry.len, entry.rcode);
+        debug!("XDP Sync: h={:x} len={} rcode={}", qhash, entry.len, entry.rcode);
         cache.insert(qhash, entry, 0)
             .map_err(|e| anyhow::anyhow!("Failed to insert cache entry: {:?}", e))?;
         
@@ -463,3 +463,4 @@ mod tests {
         assert_eq!(stats.bytes_filtered, 0);
     }
 }
+

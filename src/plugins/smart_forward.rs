@@ -519,6 +519,11 @@ impl SmartForwardPlugin {
 
             loop {
                 tokio::time::sleep(interval).await;
+                tokio::time::sleep(crate::autopilot::background_jitter_delay(3000)).await;
+                if crate::autopilot::should_skip_background_task() {
+                    debug!("📦 SmartForward persistence skipped due to high QPS");
+                    continue;
+                }
 
                 // Only save if there are new entries
                 let current_count = plugin.persist_data.len();
@@ -1279,4 +1284,5 @@ impl Plugin for SmartForwardPlugin {
         }
     }
 }
+
 

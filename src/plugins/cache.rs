@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::sync::Arc;
 use moka::future::Cache;
 use hickory_proto::op::Message;
@@ -459,6 +459,11 @@ impl CachePlugin {
             let mut ticker = tokio::time::interval(Duration::from_secs(interval));
             loop {
                 ticker.tick().await;
+                tokio::time::sleep(crate::autopilot::background_jitter_delay(3000)).await;
+                if crate::autopilot::should_skip_background_task() {
+                    debug!("💾 Cache persistence skipped due to high QPS");
+                    continue;
+                }
                 let plugin = self.clone();
                 if let Err(e) = tokio::task::spawn_blocking(move || {
                     plugin.save_to_disk();
@@ -700,7 +705,8 @@ impl CachePlugin {
         // Start Background Task: Stats + Shadow Refresh Polling
         let started = task_mgr.start(move |shutdown| async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1)); // Poll every 1 second
-            let mut stats_interval_counter = 0u32;
+            let mut last_stats_log = Instant::now() - Duration::from_secs(30);
+            let mut last_stats: (u64, u64, u64) = (0, 0, 0);
 
             // Only sync stats from one plugin instance to avoid duplicate logs
             let should_sync_stats = plugin_name_task.contains("domestic") || plugin_name_task == "cache";
@@ -712,7 +718,6 @@ impl CachePlugin {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     _ = interval.tick() => {
-                        stats_interval_counter += 1;
 
                         // Try to acquire lock (non-blocking)
                         if let Ok(mut guard) = filter_clone.try_lock() {
@@ -833,30 +838,31 @@ impl CachePlugin {
                     }
 
                     // Update stats every tick (1 second) for real-time frontend
-                    // But only log every 3 ticks (3 seconds) to avoid spam
                     // Only sync from one plugin instance to prevent race/duplicate
                     if should_sync_stats {
                         match guard.get_cache_stats() {
                             Ok(s) => {
                                 crate::stats::STATS.set_xdp_hits(s.cache_hits);
 
-                                if stats_interval_counter >= 3 {
+                                let current = (s.cache_hits, s.cache_misses, s.shadow_refreshes);
+                                if last_stats_log.elapsed() >= Duration::from_secs(30)
+                                    && current != last_stats
+                                {
                                     info!(
                                         "📊 XDP Stats Sync: Hits={}, Misses={}, Shadows={}",
                                         s.cache_hits, s.cache_misses, s.shadow_refreshes
                                     );
-                                    stats_interval_counter = 0;
+                                    last_stats = current;
+                                    last_stats_log = Instant::now();
                                 }
                             }
                             Err(e) => {
-                                if stats_interval_counter >= 3 {
+                                if last_stats_log.elapsed() >= Duration::from_secs(30) {
                                     warn!("Failed to get XDP cache stats: {}", e);
-                                    stats_interval_counter = 0;
+                                    last_stats_log = Instant::now();
                                 }
                             }
                         }
-                    } else if stats_interval_counter >= 3 {
-                        stats_interval_counter = 0;
                     }
                 }
                     }
@@ -1390,3 +1396,4 @@ impl Clone for CachePlugin {
         }
     }
 }
+
